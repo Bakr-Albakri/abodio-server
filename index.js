@@ -36,6 +36,7 @@ const gameConfig = {
   laserCooldown: 3,    // seconds between laser shots
   laserDamage: 15,     // mass removed per laser hit
   laserRange: 400,     // max laser range in world units
+  bgMusic: 0,          // background music track index (-1=none, 0-19=track)
 };
 
 // ---- Grid Shapes (admin-drawn obstacles) ----
@@ -725,7 +726,7 @@ function handleMessage(ws, conn, msg) {
       if (!conn.isAdmin) return;
       const allowed = ['splitSpeed','splitDecel','wallKill','mergeDelay','decayRate','decayMin',
         'virusCount','virusMass','ejectMass','ejectSpeed','ejectLoss',
-        'gameMode','laserCooldown','laserDamage','laserRange'];
+        'gameMode','laserCooldown','laserDamage','laserRange','bgMusic'];
       const oldVC = gameConfig.virusCount, oldVM = gameConfig.virusMass;
       for (const k of allowed) {
         if (msg[k] !== undefined) gameConfig[k] = msg[k];
