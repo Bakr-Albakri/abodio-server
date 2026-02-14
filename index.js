@@ -13,7 +13,6 @@ const DEFAULT_W = 4000, DEFAULT_H = 4000;
 let W = DEFAULT_W, H = DEFAULT_H;
 const FOOD_N = 300;
 const SM = 10, SPLIT_MIN = 35, MAX_CELLS = 16, EAT_R = 1.25, BSPD = 5, MAX_MASS = 100000;
-const VIRUS_N = 8, VIRUS_MASS = 100, EJECT_MASS = 18, EJECT_SPEED = 25, EJECT_LOSS = 18;
 const CLR = ['#FF6B6B','#4ECDC4','#45B7D1','#96CEB4','#FFEAA7','#DDA0DD','#98D8C8','#F7DC6F','#BB8FCE','#85C1E9','#F8B500','#FF69B4'];
 const FCLR = ['#FF6B6B','#4ECDC4','#45B7D1','#96CEB4','#FFEAA7','#DDA0DD','#98D8C8','#F7DC6F'];
 
@@ -22,12 +21,17 @@ const gameConfig = {
   splitSpeed: 30,      // how fast split cells fly out (pixels/tick)
   splitDecel: 0.88,    // velocity decay per tick (lower = faster stop)
   wallKill: false,     // kill players touching walls
-  mergeDelay: 0,       // ticks before cells can merge (0 = immediate)
+  mergeDelay: 15,      // seconds before split cells can merge (classic agar.io = 15)
   decayRate: 0.9994,   // mass decay multiplier per tick for cells > 200
   decayMin: 200,       // mass threshold for decay
   gridW: DEFAULT_W,    // world width
   gridH: DEFAULT_H,    // world height
   gridCellSize: 50,    // grid line spacing
+  virusCount: 8,       // number of viruses on the map
+  virusMass: 100,      // mass of each virus
+  ejectMass: 18,       // mass of ejected pellet
+  ejectSpeed: 25,      // speed of ejected pellet
+  ejectLoss: 18,       // mass lost when ejecting
 };
 
 // ---- Grid Shapes (admin-drawn obstacles) ----
@@ -113,9 +117,9 @@ initFood();
 // ---- Init Viruses ----
 function initViruses() {
   viruses = [];
-  for (let i = 0; i < VIRUS_N; i++) {
+  for (let i = 0; i < gameConfig.virusCount; i++) {
     const p = rp(200);
-    viruses.push({ id: uid(), x: p.x, y: p.y, m: VIRUS_MASS });
+    viruses.push({ id: uid(), x: p.x, y: p.y, m: gameConfig.virusMass });
   }
   virusVer++;
 }
@@ -308,7 +312,7 @@ function tick() {
           }
           // Respawn virus elsewhere
           const np = rp(200);
-          viruses[vi] = { id: uid(), x: np.x, y: np.y, m: VIRUS_MASS };
+          viruses[vi] = { id: uid(), x: np.x, y: np.y, m: gameConfig.virusMass };
           virusChanged = true;
         }
       }
@@ -366,13 +370,13 @@ function doSplit(p) {
 function doEject(p) {
   const c = com(p.cells), ba = Math.atan2(p.my - c.y, p.mx - c.x);
   for (const cell of p.cells) {
-    if (cell.m < EJECT_LOSS + 10) continue; // need enough mass
-    cell.m -= EJECT_LOSS;
+    if (cell.m < gameConfig.ejectLoss + 10) continue; // need enough mass
+    cell.m -= gameConfig.ejectLoss;
     const a = ba;
     // Spawn ejected mass as small food pellet moving outward
     const ex = cell.x + Math.cos(a) * (rad(cell.m) + 10);
     const ey = cell.y + Math.sin(a) * (rad(cell.m) + 10);
-    food.push({ x: clp(ex, 20, W - 20), y: clp(ey, 20, H - 20), c: cell.c, ejVx: Math.cos(a) * EJECT_SPEED, ejVy: Math.sin(a) * EJECT_SPEED });
+    food.push({ x: clp(ex, 20, W - 20), y: clp(ey, 20, H - 20), c: cell.c, ejVx: Math.cos(a) * gameConfig.ejectSpeed, ejVy: Math.sin(a) * gameConfig.ejectSpeed });
     foodVer++;
     break; // eject one per press
   }
@@ -622,9 +626,14 @@ function handleMessage(ws, conn, msg) {
     // ---- Admin Config Update ----
     case 'acfg': {
       if (!conn.isAdmin) return;
-      const allowed = ['splitSpeed','splitDecel','wallKill','mergeDelay','decayRate','decayMin'];
+      const allowed = ['splitSpeed','splitDecel','wallKill','mergeDelay','decayRate','decayMin',
+        'virusCount','virusMass','ejectMass','ejectSpeed','ejectLoss'];
       for (const k of allowed) {
         if (msg[k] !== undefined) gameConfig[k] = msg[k];
+      }
+      // Re-init viruses if count or mass changed
+      if (msg.virusCount !== undefined || msg.virusMass !== undefined) {
+        initViruses();
       }
       // Broadcast new config to all players
       const cfgMsg = JSON.stringify({ t: 'cfg', cfg: gameConfig });
