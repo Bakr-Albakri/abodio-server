@@ -412,10 +412,11 @@ function tick() {
   }
   if (virusChanged) virusVer++;
 
-  // ---- PvP — at least one side must be a bot ----
+  // ---- PvP — at least one side must be a bot (disabled in laser mode) ----
   const all = [];
   for (const p of players.values()) for (const c of p.cells) all.push({ cell: c, p });
   const eaten = new Set();
+  if (gameConfig.gameMode === 'laser') { /* no eating in laser mode */ } else {
   for (let i = 0; i < all.length; i++) {
     if (eaten.has(all[i].cell.id)) continue;
     for (let j = i + 1; j < all.length; j++) {
@@ -428,6 +429,8 @@ function tick() {
       else if (c2.m > c1.m * EAT_R && d < rad(c2.m) - rad(c1.m) * 0.6) { c2.m += c1.m; p1.cells = p1.cells.filter(c => c.id !== c1.id); eaten.add(c1.id); break; }
     }
   }
+
+  } // end PvP skip for laser mode
 
   // ---- Respawn dead players (bots auto-respawn, humans get death event) ----
   for (const p of players.values()) {
@@ -914,6 +917,7 @@ function handleMessage(ws, conn, msg) {
     }
     // ---- Client Eat Report ----
     case 'e': {
+      if (gameConfig.gameMode === 'laser') return; // no eating in laser mode
       if (!conn.playerId) return;
       const eater = players.get(conn.playerId);
       if (!eater) return;
