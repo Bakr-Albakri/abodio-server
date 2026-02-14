@@ -792,6 +792,16 @@ function handleMessage(ws, conn, msg) {
       ws.send(JSON.stringify({ t: 'am', ok: 1, action: 'admin_add_bot', botId }));
       break;
     }
+    // ---- Admin Rename ----
+    case 'arn': {
+      if (!conn.isAdmin) return;
+      const rp = players.get(msg.pid);
+      if (rp && msg.newName && typeof msg.newName === 'string') {
+        rp.name = msg.newName.slice(0, 20);
+      }
+      ws.send(JSON.stringify({ t: 'am', ok: 1, action: 'admin_rename' }));
+      break;
+    }
     // ---- Admin Remove ----
     case 'ax': {
       if (!conn.isAdmin) return;
