@@ -538,8 +538,9 @@ function handleMessage(ws, conn, msg) {
           const cell = p.cells.find(c => c.id === cd[0]);
           if (cell) {
             cell.x = cd[1]; cell.y = cd[2];
-            // Only accept mass if >= server value (prevents overwriting admin feed)
-            if (typeof cd[3] === 'number' && cd[3] >= cell.m) cell.m = Math.min(cd[3], MAX_MASS);
+            // Accept mass increases only if small (food eating ≈ +1–20 per update).
+            // Large jumps indicate stale data that would undo virus splits.
+            if (typeof cd[3] === 'number' && cd[3] >= cell.m && cd[3] <= cell.m + 60) cell.m = Math.min(cd[3], MAX_MASS);
           }
         }
       }
