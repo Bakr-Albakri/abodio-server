@@ -21,7 +21,7 @@ const gameConfig = {
   splitSpeed: 30,      // how fast split cells fly out (pixels/tick)
   splitDecel: 0.88,    // velocity decay per tick (lower = faster stop)
   wallKill: false,     // kill players touching walls
-  mergeDelay: 15,      // seconds before split cells can merge (classic agar.io = 15)
+  mergeDelay: 10,      // seconds before split cells can merge (classic agar.io = 15, default = 10)
   decayRate: 0.9994,   // mass decay multiplier per tick for cells > 200
   decayMin: 200,       // mass threshold for decay
   gridW: DEFAULT_W,    // world width
@@ -32,6 +32,10 @@ const gameConfig = {
   ejectMass: 18,       // mass of ejected pellet
   ejectSpeed: 25,      // speed of ejected pellet
   ejectLoss: 18,       // mass lost when ejecting
+  gameMode: 'default', // 'default' | 'laser'
+  laserCooldown: 3,    // seconds between laser shots
+  laserDamage: 15,     // mass removed per laser hit
+  laserRange: 400,     // max laser range in world units
 };
 
 // ---- Grid Shapes (admin-drawn obstacles) ----
@@ -337,12 +341,24 @@ function tick() {
     }
   }
 
-  // ---- Respawn dead players ----
+  // ---- Respawn dead players (bots auto-respawn, humans get death event) ----
   for (const p of players.values()) {
     if (p.cells.length === 0) {
-      const pos = rp();
-      p.cells = [{ id: uid(), x: pos.x, y: pos.y, m: SM, c: p.color }];
-      if (p.bot) { p.bot.tx = pos.x; p.bot.ty = pos.y; }
+      if (p.isBot) {
+        // Bots auto-respawn
+        const pos = rp();
+        p.cells = [{ id: uid(), x: pos.x, y: pos.y, m: SM, c: p.color }];
+        if (p.bot) { p.bot.tx = pos.x; p.bot.ty = pos.y; }
+      } else if (!p.dead) {
+        // Human died — send death event, don't respawn until they request it
+        p.dead = true;
+        p.deathTime = Date.now();
+        for (const [ws, conn] of connections) {
+          if (conn.playerId === p.id && ws.readyState === 1) {
+            safeSend(ws, JSON.stringify({ t: 'death', peak: p.peakMass || SM, timeAlive: Math.floor((Date.now() - (p.joinTime || Date.now())) / 1000) }));
+          }
+        }
+      }
     }
   }
 }
@@ -512,7 +528,8 @@ function handleMessage(ws, conn, msg) {
       const pos = rp();
       const cell = { id: uid(), x: pos.x, y: pos.y, m: SM, c: color };
       const p = { id, name, color, emoji, isBot: false, feedBonus: 0, cells: [cell],
-        mx: pos.x, my: pos.y, lastPing: Date.now(), device };
+        mx: pos.x, my: pos.y, lastPing: Date.now(), device,
+        dead: false, deathTime: 0, joinTime: Date.now(), peakMass: SM, lastLaser: 0 };
       players.set(id, p);
       conn.playerId = id;
       logActivity('join', name, device, conn.ip);
@@ -543,6 +560,9 @@ function handleMessage(ws, conn, msg) {
             if (typeof cd[3] === 'number' && cd[3] >= cell.m && cd[3] <= cell.m + 60) cell.m = Math.min(cd[3], MAX_MASS);
           }
         }
+        // Track peak mass
+        const tm = tmass(p.cells);
+        if (tm > (p.peakMass || 0)) p.peakMass = tm;
       }
       p.lastPing = Date.now();
       break;
@@ -567,6 +587,71 @@ function handleMessage(ws, conn, msg) {
         players.delete(conn.playerId);
         conn.playerId = null;
       }
+      break;
+    }
+    // ---- Respawn (after death screen) ----
+    case 'respawn': {
+      const p = players.get(conn.playerId);
+      if (!p || p.isBot) return;
+      if (p.dead && p.cells.length === 0) {
+        const pos = rp();
+        p.cells = [{ id: uid(), x: pos.x, y: pos.y, m: SM, c: p.color }];
+        p.dead = false;
+        p.joinTime = Date.now();
+        p.peakMass = SM;
+        p.lastLaser = 0;
+      }
+      break;
+    }
+    // ---- Laser (laser mode only) ----
+    case 'laser': {
+      if (gameConfig.gameMode !== 'laser') return;
+      const p = players.get(conn.playerId);
+      if (!p || p.isBot || p.cells.length === 0) return;
+      const now = Date.now();
+      if (now - (p.lastLaser || 0) < gameConfig.laserCooldown * 1000) return;
+      p.lastLaser = now;
+      // Calculate laser line from player center toward angle
+      const c = com(p.cells);
+      const angle = typeof msg.angle === 'number' ? msg.angle : 0;
+      const range = gameConfig.laserRange;
+      const ex = c.x + Math.cos(angle) * range;
+      const ey = c.y + Math.sin(angle) * range;
+      // Check hits against all other players
+      const hits = [];
+      for (const [vid, vp] of players) {
+        if (vid === p.id) continue;
+        for (const cell of vp.cells) {
+          // Point-to-segment distance check
+          const cr = rad(cell.m);
+          const dx = ex - c.x, dy = ey - c.y;
+          const fx = c.x - cell.x, fy = c.y - cell.y;
+          const a2 = dx * dx + dy * dy;
+          const b2 = 2 * (fx * dx + fy * dy);
+          const c2 = fx * fx + fy * fy - cr * cr;
+          let disc = b2 * b2 - 4 * a2 * c2;
+          if (disc >= 0) {
+            disc = Math.sqrt(disc);
+            const t1 = (-b2 - disc) / (2 * a2);
+            const t2 = (-b2 + disc) / (2 * a2);
+            if ((t1 >= 0 && t1 <= 1) || (t2 >= 0 && t2 <= 1) || (t1 < 0 && t2 > 1)) {
+              // Hit! Remove mass
+              const dmg = Math.min(cell.m - 1, gameConfig.laserDamage);
+              cell.m -= dmg;
+              hits.push({ pid: vid, cid: cell.id, dmg });
+            }
+          }
+        }
+      }
+      // Broadcast laser visual to all players
+      broadcast(JSON.stringify({
+        t: 'laser',
+        from: { x: Math.round(c.x), y: Math.round(c.y) },
+        to: { x: Math.round(ex), y: Math.round(ey) },
+        color: p.color,
+        pid: p.id,
+        hits: hits.length,
+      }));
       break;
     }
     // ---- Admin Auth ----
@@ -639,7 +724,8 @@ function handleMessage(ws, conn, msg) {
     case 'acfg': {
       if (!conn.isAdmin) return;
       const allowed = ['splitSpeed','splitDecel','wallKill','mergeDelay','decayRate','decayMin',
-        'virusCount','virusMass','ejectMass','ejectSpeed','ejectLoss'];
+        'virusCount','virusMass','ejectMass','ejectSpeed','ejectLoss',
+        'gameMode','laserCooldown','laserDamage','laserRange'];
       const oldVC = gameConfig.virusCount, oldVM = gameConfig.virusMass;
       for (const k of allowed) {
         if (msg[k] !== undefined) gameConfig[k] = msg[k];
