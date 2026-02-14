@@ -404,6 +404,16 @@ function mkLb() {
 
 function serFood() { return food.map(f => [Math.round(f.x), Math.round(f.y), f.c]); }
 
+// Safe send — prevents one bad connection from crashing broadcast loops
+function safeSend(ws, data) {
+  try { if (ws.readyState === 1) ws.send(data); }
+  catch (_) { /* ignore send errors */ }
+}
+
+function broadcast(data) {
+  for (const [cws] of connections) safeSend(cws, data);
+}
+
 function sendAdminState(ws) {
   let totalCells = 0;
   const playerList = [];
@@ -628,17 +638,17 @@ function handleMessage(ws, conn, msg) {
       if (!conn.isAdmin) return;
       const allowed = ['splitSpeed','splitDecel','wallKill','mergeDelay','decayRate','decayMin',
         'virusCount','virusMass','ejectMass','ejectSpeed','ejectLoss'];
+      const oldVC = gameConfig.virusCount, oldVM = gameConfig.virusMass;
       for (const k of allowed) {
         if (msg[k] !== undefined) gameConfig[k] = msg[k];
       }
-      // Re-init viruses if count or mass changed
-      if (msg.virusCount !== undefined || msg.virusMass !== undefined) {
+      // Re-init viruses only if count or mass actually changed
+      if (gameConfig.virusCount !== oldVC || gameConfig.virusMass !== oldVM) {
         initViruses();
       }
       // Broadcast new config to all players
-      const cfgMsg = JSON.stringify({ t: 'cfg', cfg: gameConfig });
-      for (const [cws] of connections) { if (cws.readyState === 1) cws.send(cfgMsg); }
-      ws.send(JSON.stringify({ t: 'am', ok: 1, action: 'admin_config' }));
+      broadcast(JSON.stringify({ t: 'cfg', cfg: gameConfig }));
+      safeSend(ws, JSON.stringify({ t: 'am', ok: 1, action: 'admin_config' }));
       break;
     }
     // ---- Admin Grid Update (size + shapes) ----
@@ -655,9 +665,8 @@ function handleMessage(ws, conn, msg) {
           typeof s.x === 'number' && typeof s.y === 'number').slice(0, 50);
       }
       // Broadcast to all players
-      const gridMsg = JSON.stringify({ t: 'gcfg', cfg: gameConfig, shapes: gridShapes });
-      for (const [cws] of connections) { if (cws.readyState === 1) cws.send(gridMsg); }
-      ws.send(JSON.stringify({ t: 'am', ok: 1, action: 'admin_grid' }));
+      broadcast(JSON.stringify({ t: 'gcfg', cfg: gameConfig, shapes: gridShapes }));
+      safeSend(ws, JSON.stringify({ t: 'am', ok: 1, action: 'admin_grid' }));
       break;
     }
     // ---- Admin Grid Reset ----
@@ -668,9 +677,8 @@ function handleMessage(ws, conn, msg) {
       gameConfig.gridCellSize = DEFAULT_GRID_CELL_SIZE;
       gridShapes = [];
       applyGridSize();
-      const resetMsg = JSON.stringify({ t: 'gcfg', cfg: gameConfig, shapes: gridShapes });
-      for (const [cws] of connections) { if (cws.readyState === 1) cws.send(resetMsg); }
-      ws.send(JSON.stringify({ t: 'am', ok: 1, action: 'admin_grid_reset' }));
+      broadcast(JSON.stringify({ t: 'gcfg', cfg: gameConfig, shapes: gridShapes }));
+      safeSend(ws, JSON.stringify({ t: 'am', ok: 1, action: 'admin_grid_reset' }));
       break;
     }
     // ---- Admin Countdown / Announce Reset ----
@@ -685,21 +693,19 @@ function handleMessage(ws, conn, msg) {
         if (!countdown) { clearInterval(countdownInterval); countdownInterval = null; return; }
         const remaining = Math.max(0, Math.ceil((countdown.endsAt - Date.now()) / 1000));
         const cdMsg = JSON.stringify({ t: 'cd', remaining });
-        for (const [cws] of connections) { if (cws.readyState === 1) cws.send(cdMsg); }
+        broadcast(cdMsg);
         if (remaining <= 0) {
           clearInterval(countdownInterval);
           countdownInterval = null;
           countdown = null;
           // Reset the server
           players.clear(); kicked.clear(); initFood(); initViruses(); gen++;
-          const resetMsg = JSON.stringify({ t: 'cd', remaining: 0, reset: true });
-          for (const [cws] of connections) { if (cws.readyState === 1) cws.send(resetMsg); }
+          broadcast(JSON.stringify({ t: 'cd', remaining: 0, reset: true }));
         }
       }, 1000);
       // Send immediate first tick
-      const cdMsg = JSON.stringify({ t: 'cd', remaining: secs });
-      for (const [cws] of connections) { if (cws.readyState === 1) cws.send(cdMsg); }
-      ws.send(JSON.stringify({ t: 'am', ok: 1, action: 'admin_countdown' }));
+      broadcast(JSON.stringify({ t: 'cd', remaining: secs }));
+      safeSend(ws, JSON.stringify({ t: 'am', ok: 1, action: 'admin_countdown' }));
       break;
     }
     // ---- Admin Cancel Countdown ----
@@ -707,9 +713,8 @@ function handleMessage(ws, conn, msg) {
       if (!conn.isAdmin) return;
       if (countdownInterval) { clearInterval(countdownInterval); countdownInterval = null; }
       countdown = null;
-      const cancelMsg = JSON.stringify({ t: 'cd', remaining: -1 });
-      for (const [cws] of connections) { if (cws.readyState === 1) cws.send(cancelMsg); }
-      ws.send(JSON.stringify({ t: 'am', ok: 1, action: 'admin_cancel_countdown' }));
+      broadcast(JSON.stringify({ t: 'cd', remaining: -1 }));
+      safeSend(ws, JSON.stringify({ t: 'am', ok: 1, action: 'admin_cancel_countdown' }));
       break;
     }
     // ---- Client Eat Report ----
@@ -787,13 +792,15 @@ function broadcastState() {
   const raw = JSON.stringify(state);
   dbg.payloadBytes = raw.length;
   for (const [ws, conn] of connections) {
-    if (conn.playerId && ws.readyState === 1) ws.send(raw);
+    if (conn.playerId) safeSend(ws, raw);
   }
 }
 
 function broadcastAdminState() {
   for (const [ws, conn] of connections) {
-    if (conn.isAdmin && ws.readyState === 1) sendAdminState(ws);
+    if (conn.isAdmin && ws.readyState === 1) {
+      try { sendAdminState(ws); } catch (_) { /* ignore */ }
+    }
   }
 }
 
