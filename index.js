@@ -167,6 +167,7 @@ function logActivity(type, name, device, ip) {
 // ---- Countdown / Announcement ----
 let countdown = null; // { endsAt: timestamp, seconds: original }
 let countdownInterval = null;
+let serverPaused = false; // when true: no ticks, reject joins, disconnect players
 
 // ---- Connection Tracking ----
 // Map<ws, { playerId: string|null, isAdmin: boolean }>
@@ -545,6 +546,7 @@ function sendAdminState(ws) {
     activity: activityLog.slice(-100),
     cfg: gameConfig,
     shapes: gridShapes,
+    paused: serverPaused,
   }));
 }
 
@@ -605,6 +607,7 @@ function handleMessage(ws, conn, msg) {
   switch (msg.t) {
     // ---- Join ----
     case 'j': {
+      if (serverPaused) { ws.send(JSON.stringify({ t: 'k', reason: 'Server is currently paused. Try again later.' })); return; }
       const name = (msg.name || 'Player').trim().slice(0, 20);
       const kickReason = kicked.get(name.toLowerCase());
       if (kickReason) { ws.send(JSON.stringify({ t: 'k', reason: kickReason })); return; }
@@ -767,6 +770,23 @@ function handleMessage(ws, conn, msg) {
       } else {
         ws.send(JSON.stringify({ t: 'aa', ok: 0 }));
       }
+      break;
+    }
+    // ---- Admin Pause / Resume ----
+    case 'apause': {
+      if (!conn.isAdmin) return;
+      serverPaused = !!msg.paused;
+      if (serverPaused) {
+        // Kick all non-admin players and bots
+        for (const [ows, oc] of connections) {
+          if (oc.playerId && !oc.isAdmin && ows.readyState === 1) {
+            ows.send(JSON.stringify({ t: 'k', reason: 'Server has been paused by admin.' }));
+          }
+        }
+        // Remove all players (bots + humans)
+        players.clear();
+      }
+      ws.send(JSON.stringify({ t: 'am', ok: 1, action: 'admin_pause' }));
       break;
     }
     // ---- Admin Reset ----
@@ -985,6 +1005,7 @@ let lastBroadcastVv = -1;
 let lastBroadcastMv = -1;
 
 setInterval(() => {
+  if (serverPaused) return; // skip everything when paused
   const t0 = performance.now();
   tick();
   const tickMs = performance.now() - t0;
