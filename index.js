@@ -318,7 +318,8 @@ function handleMessage(ws, conn, msg) {
       }
       const id = `p-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const device = parseDevice(msg.ua || 'Unknown');
-      const color = pick(CLR), pos = rp();
+      const color = (msg.color && /^#[0-9A-Fa-f]{6}$/.test(msg.color)) ? msg.color : pick(CLR);
+      const pos = rp();
       const cell = { id: uid(), x: pos.x, y: pos.y, m: SM, c: color };
       const p = { id, name, color, isBot: false, feedBonus: 0, cells: [cell],
         mx: pos.x, my: pos.y, lastPing: Date.now(), device };
