@@ -14,6 +14,16 @@ const SM = 10, SPLIT_MIN = 35, MAX_CELLS = 16, EAT_R = 1.25, BSPD = 5, MAX_MASS 
 const CLR = ['#FF6B6B','#4ECDC4','#45B7D1','#96CEB4','#FFEAA7','#DDA0DD','#98D8C8','#F7DC6F','#BB8FCE','#85C1E9','#F8B500','#FF69B4'];
 const FCLR = ['#FF6B6B','#4ECDC4','#45B7D1','#96CEB4','#FFEAA7','#DDA0DD','#98D8C8','#F7DC6F'];
 
+// ---- Adjustable game settings (admin panel) ----
+const gameConfig = {
+  splitSpeed: 30,      // how fast split cells fly out (pixels/tick)
+  splitDecel: 0.88,    // velocity decay per tick (lower = faster stop)
+  wallKill: false,     // kill players touching walls
+  mergeDelay: 0,       // ticks before cells can merge (0 = immediate)
+  decayRate: 0.9994,   // mass decay multiplier per tick for cells > 200
+  decayMin: 200,       // mass threshold for decay
+};
+
 // ---- Utilities ----
 const rad = m => Math.sqrt(m) * 4;
 const spd = m => BSPD * Math.pow(m, -0.1);
@@ -48,8 +58,16 @@ const activityLog = []; // { ts, type: 'join'|'leave', name }
 let lastBroadcastEvLen = 0; // track what's been sent
 function logActivity(type, name) {
   activityLog.push({ ts: Date.now(), type, name });
-  if (activityLog.length > 200) activityLog.splice(0, activityLog.length - 200);
+  if (activityLog.length > 200) {
+    const trimmed = activityLog.length - 200;
+    activityLog.splice(0, trimmed);
+    lastBroadcastEvLen = Math.max(0, lastBroadcastEvLen - trimmed);
+  }
 }
+
+// ---- Countdown / Announcement ----
+let countdown = null; // { endsAt: timestamp, seconds: original }
+let countdownInterval = null;
 
 // ---- Connection Tracking ----
 // Map<ws, { playerId: string|null, isAdmin: boolean }>
@@ -139,14 +157,37 @@ function tick() {
       if (p.cells.length > 0) p.cells[0].m = Math.min(p.cells[0].m + chunk, MAX_MASS);
       p.feedBonus -= chunk;
     }
+    // Apply split velocity to ALL cells (bots + humans)
+    for (const cell of p.cells) {
+      if (cell.vx || cell.vy) {
+        cell.x += (cell.vx || 0) * dt;
+        cell.y += (cell.vy || 0) * dt;
+        cell.vx = (cell.vx || 0) * gameConfig.splitDecel;
+        cell.vy = (cell.vy || 0) * gameConfig.splitDecel;
+        if (Math.abs(cell.vx) < 0.5 && Math.abs(cell.vy) < 0.5) { cell.vx = 0; cell.vy = 0; }
+      }
+    }
     // Move bots only (human positions come from client)
     if (p.isBot) {
       for (const cell of p.cells) {
         const dx = p.mx - cell.x, dy = p.my - cell.y, d = Math.sqrt(dx * dx + dy * dy);
         if (d > 5) { const s = spd(cell.m) * dt; cell.x += (dx / d) * s; cell.y += (dy / d) * s; }
-        const r = rad(cell.m);
-        cell.x = clp(cell.x, r, Math.max(r, W - r)); cell.y = clp(cell.y, r, Math.max(r, H - r));
       }
+    }
+    // Boundary + wall kill
+    for (const cell of p.cells) {
+      const r = rad(cell.m);
+      if (gameConfig.wallKill) {
+        if (cell.x - r < 0 || cell.x + r > W || cell.y - r < 0 || cell.y + r > H) {
+          cell.m = 0; // mark for removal
+        }
+      }
+      cell.x = clp(cell.x, r, Math.max(r, W - r));
+      cell.y = clp(cell.y, r, Math.max(r, H - r));
+    }
+    // Remove dead cells from wall kill
+    if (gameConfig.wallKill) {
+      p.cells = p.cells.filter(c => c.m > 0);
     }
     // Merge/push own cells
     for (let i = 0; i < p.cells.length; i++) {
@@ -158,7 +199,7 @@ function tick() {
     }
     // Decay & mass cap
     for (const cell of p.cells) {
-      if (cell.m > 200) cell.m *= Math.pow(0.9994, dt);
+      if (cell.m > gameConfig.decayMin) cell.m *= Math.pow(gameConfig.decayRate, dt);
       if (cell.m > MAX_MASS) cell.m = MAX_MASS;
     }
   }
@@ -217,7 +258,12 @@ function doSplit(p) {
     if (cell.m >= SPLIT_MIN && p.cells.length + news.length < MAX_CELLS) {
       const half = Math.floor(cell.m / 2); cell.m = half;
       const a = ba + (Math.random() - 0.5) * 0.5, r = rad(half);
-      news.push({ id: uid(), x: cell.x + Math.cos(a) * (r + 100), y: cell.y + Math.sin(a) * (r + 100), m: half, c: p.color });
+      const spawnDist = r + 10;
+      news.push({
+        id: uid(), x: cell.x + Math.cos(a) * spawnDist, y: cell.y + Math.sin(a) * spawnDist,
+        m: half, c: p.color,
+        vx: Math.cos(a) * gameConfig.splitSpeed, vy: Math.sin(a) * gameConfig.splitSpeed,
+      });
     }
   }
   p.cells.push(...news);
@@ -260,6 +306,7 @@ function sendAdminState(ws) {
     foodCount: food.length, foodVer, gen,
     debug: { ...dbg, playerCount: players.size, cellCount: totalCells },
     activity: activityLog.slice(-50),
+    cfg: gameConfig,
   }));
 }
 
@@ -348,6 +395,7 @@ function handleMessage(ws, conn, msg) {
         t: 'w', id, mc: cell, w: W, h: H,
         f: serFood(), fv: foodVer, gen,
         p: serPlayers(), lb: mkLb(),
+        cfg: gameConfig,
       }));
       break;
     }
@@ -450,6 +498,84 @@ function handleMessage(ws, conn, msg) {
       const p = players.get(msg.pid);
       if (p) p.feedBonus += (msg.amount || 100);
       ws.send(JSON.stringify({ t: 'am', ok: 1, action: 'admin_feed' }));
+      break;
+    }
+    // ---- Admin Config Update ----
+    case 'acfg': {
+      if (!conn.isAdmin) return;
+      const allowed = ['splitSpeed','splitDecel','wallKill','mergeDelay','decayRate','decayMin'];
+      for (const k of allowed) {
+        if (msg[k] !== undefined) gameConfig[k] = msg[k];
+      }
+      // Broadcast new config to all players
+      const cfgMsg = JSON.stringify({ t: 'cfg', cfg: gameConfig });
+      for (const [cws] of connections) { if (cws.readyState === 1) cws.send(cfgMsg); }
+      ws.send(JSON.stringify({ t: 'am', ok: 1, action: 'admin_config' }));
+      break;
+    }
+    // ---- Admin Countdown / Announce Reset ----
+    case 'acd': {
+      if (!conn.isAdmin) return;
+      const secs = Math.max(5, Math.min(msg.seconds || 30, 300));
+      countdown = { endsAt: Date.now() + secs * 1000, seconds: secs };
+      // Clear any existing countdown interval
+      if (countdownInterval) clearInterval(countdownInterval);
+      // Broadcast countdown tick every second
+      countdownInterval = setInterval(() => {
+        if (!countdown) { clearInterval(countdownInterval); countdownInterval = null; return; }
+        const remaining = Math.max(0, Math.ceil((countdown.endsAt - Date.now()) / 1000));
+        const cdMsg = JSON.stringify({ t: 'cd', remaining });
+        for (const [cws] of connections) { if (cws.readyState === 1) cws.send(cdMsg); }
+        if (remaining <= 0) {
+          clearInterval(countdownInterval);
+          countdownInterval = null;
+          countdown = null;
+          // Reset the server
+          players.clear(); kicked.clear(); initFood(); gen++;
+          const resetMsg = JSON.stringify({ t: 'cd', remaining: 0, reset: true });
+          for (const [cws] of connections) { if (cws.readyState === 1) cws.send(resetMsg); }
+        }
+      }, 1000);
+      // Send immediate first tick
+      const cdMsg = JSON.stringify({ t: 'cd', remaining: secs });
+      for (const [cws] of connections) { if (cws.readyState === 1) cws.send(cdMsg); }
+      ws.send(JSON.stringify({ t: 'am', ok: 1, action: 'admin_countdown' }));
+      break;
+    }
+    // ---- Admin Cancel Countdown ----
+    case 'acdc': {
+      if (!conn.isAdmin) return;
+      if (countdownInterval) { clearInterval(countdownInterval); countdownInterval = null; }
+      countdown = null;
+      const cancelMsg = JSON.stringify({ t: 'cd', remaining: -1 });
+      for (const [cws] of connections) { if (cws.readyState === 1) cws.send(cancelMsg); }
+      ws.send(JSON.stringify({ t: 'am', ok: 1, action: 'admin_cancel_countdown' }));
+      break;
+    }
+    // ---- Client Eat Report ----
+    case 'e': {
+      if (!conn.playerId) return;
+      const eater = players.get(conn.playerId);
+      if (!eater) return;
+      // msg.cid = eaten cell id, msg.eid = eater cell id
+      if (!msg.cid || !msg.eid) return;
+      // Find eater cell
+      const eaterCell = eater.cells.find(c => c.id === msg.eid);
+      if (!eaterCell) return;
+      // Find victim cell across all players
+      for (const [vid, vp] of players) {
+        if (vid === conn.playerId) continue;
+        const idx = vp.cells.findIndex(c => c.id === msg.cid);
+        if (idx !== -1) {
+          const eaten = vp.cells[idx];
+          // Validate: eater must be bigger
+          if (eaterCell.m > eaten.m * 0.8) {
+            eaterCell.m = Math.min(eaterCell.m + eaten.m, MAX_MASS);
+            vp.cells.splice(idx, 1);
+          }
+          break;
+        }
+      }
       break;
     }
   }
