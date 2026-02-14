@@ -9,7 +9,9 @@ const PORT = process.env.PORT || 3001;
 const ADMIN_PW = process.env.ADMIN_PW || 'changeme';
 
 // ---- Config ----
-const W = 4000, H = 4000, FOOD_N = 300;
+const DEFAULT_W = 4000, DEFAULT_H = 4000;
+let W = DEFAULT_W, H = DEFAULT_H;
+const FOOD_N = 300;
 const SM = 10, SPLIT_MIN = 35, MAX_CELLS = 16, EAT_R = 1.25, BSPD = 5, MAX_MASS = 100000;
 const CLR = ['#FF6B6B','#4ECDC4','#45B7D1','#96CEB4','#FFEAA7','#DDA0DD','#98D8C8','#F7DC6F','#BB8FCE','#85C1E9','#F8B500','#FF69B4'];
 const FCLR = ['#FF6B6B','#4ECDC4','#45B7D1','#96CEB4','#FFEAA7','#DDA0DD','#98D8C8','#F7DC6F'];
@@ -22,7 +24,31 @@ const gameConfig = {
   mergeDelay: 0,       // ticks before cells can merge (0 = immediate)
   decayRate: 0.9994,   // mass decay multiplier per tick for cells > 200
   decayMin: 200,       // mass threshold for decay
+  gridW: DEFAULT_W,    // world width
+  gridH: DEFAULT_H,    // world height
+  gridCellSize: 50,    // grid line spacing
 };
+
+// ---- Grid Shapes (admin-drawn obstacles) ----
+let gridShapes = []; // { type: 'rect'|'circle', x, y, w?, h?, r?, color }
+const DEFAULT_GRID_CELL_SIZE = 50;
+
+function applyGridSize() {
+  W = gameConfig.gridW;
+  H = gameConfig.gridH;
+  // Clamp all players and food to new bounds
+  for (const p of players.values()) {
+    for (const c of p.cells) {
+      const r = rad(c.m);
+      c.x = clp(c.x, r, Math.max(r, W - r));
+      c.y = clp(c.y, r, Math.max(r, H - r));
+    }
+  }
+  for (const f of food) {
+    f.x = clp(f.x, 20, W - 20);
+    f.y = clp(f.y, 20, H - 20);
+  }
+}
 
 // ---- Utilities ----
 const rad = m => Math.sqrt(m) * 4;
@@ -307,6 +333,7 @@ function sendAdminState(ws) {
     debug: { ...dbg, playerCount: players.size, cellCount: totalCells },
     activity: activityLog.slice(-50),
     cfg: gameConfig,
+    shapes: gridShapes,
   }));
 }
 
@@ -396,6 +423,7 @@ function handleMessage(ws, conn, msg) {
         f: serFood(), fv: foodVer, gen,
         p: serPlayers(), lb: mkLb(),
         cfg: gameConfig,
+        shapes: gridShapes,
       }));
       break;
     }
@@ -511,6 +539,38 @@ function handleMessage(ws, conn, msg) {
       const cfgMsg = JSON.stringify({ t: 'cfg', cfg: gameConfig });
       for (const [cws] of connections) { if (cws.readyState === 1) cws.send(cfgMsg); }
       ws.send(JSON.stringify({ t: 'am', ok: 1, action: 'admin_config' }));
+      break;
+    }
+    // ---- Admin Grid Update (size + shapes) ----
+    case 'agrid': {
+      if (!conn.isAdmin) return;
+      // Update grid dimensions
+      if (typeof msg.gridW === 'number') gameConfig.gridW = clp(msg.gridW, 500, 20000);
+      if (typeof msg.gridH === 'number') gameConfig.gridH = clp(msg.gridH, 500, 20000);
+      if (typeof msg.gridCellSize === 'number') gameConfig.gridCellSize = clp(msg.gridCellSize, 10, 500);
+      applyGridSize();
+      // Update shapes if provided
+      if (Array.isArray(msg.shapes)) {
+        gridShapes = msg.shapes.filter(s => s && (s.type === 'rect' || s.type === 'circle') &&
+          typeof s.x === 'number' && typeof s.y === 'number').slice(0, 50);
+      }
+      // Broadcast to all players
+      const gridMsg = JSON.stringify({ t: 'gcfg', cfg: gameConfig, shapes: gridShapes });
+      for (const [cws] of connections) { if (cws.readyState === 1) cws.send(gridMsg); }
+      ws.send(JSON.stringify({ t: 'am', ok: 1, action: 'admin_grid' }));
+      break;
+    }
+    // ---- Admin Grid Reset ----
+    case 'agrr': {
+      if (!conn.isAdmin) return;
+      gameConfig.gridW = DEFAULT_W;
+      gameConfig.gridH = DEFAULT_H;
+      gameConfig.gridCellSize = DEFAULT_GRID_CELL_SIZE;
+      gridShapes = [];
+      applyGridSize();
+      const resetMsg = JSON.stringify({ t: 'gcfg', cfg: gameConfig, shapes: gridShapes });
+      for (const [cws] of connections) { if (cws.readyState === 1) cws.send(resetMsg); }
+      ws.send(JSON.stringify({ t: 'am', ok: 1, action: 'admin_grid_reset' }));
       break;
     }
     // ---- Admin Countdown / Announce Reset ----
