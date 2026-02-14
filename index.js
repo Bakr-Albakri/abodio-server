@@ -227,7 +227,8 @@ function serPlayers() {
   const out = [];
   for (const p of players.values()) {
     out.push([p.id, p.name, p.color, p.isBot ? 1 : 0,
-      p.cells.map(c => [c.id, Math.round(c.x), Math.round(c.y), Math.round(c.m * 10) / 10, c.c])]);
+      p.cells.map(c => [c.id, Math.round(c.x), Math.round(c.y), Math.round(c.m * 10) / 10, c.c]),
+      p.emoji || '']);
   }
   return out;
 }
@@ -332,9 +333,10 @@ function handleMessage(ws, conn, msg) {
       const id = `p-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const device = parseDevice(msg.ua || 'Unknown');
       const color = (msg.color && /^#[0-9A-Fa-f]{6}$/.test(msg.color)) ? msg.color : pick(CLR);
+      const emoji = (msg.emoji && typeof msg.emoji === 'string' && msg.emoji.length <= 4) ? msg.emoji : '';
       const pos = rp();
       const cell = { id: uid(), x: pos.x, y: pos.y, m: SM, c: color };
-      const p = { id, name, color, isBot: false, feedBonus: 0, cells: [cell],
+      const p = { id, name, color, emoji, isBot: false, feedBonus: 0, cells: [cell],
         mx: pos.x, my: pos.y, lastPing: Date.now(), device };
       players.set(id, p);
       conn.playerId = id;
