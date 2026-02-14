@@ -523,7 +523,7 @@ function handleMessage(ws, conn, msg) {
         cfg: gameConfig,
         shapes: gridShapes,
         v: viruses.map(v => [v.id, Math.round(v.x), Math.round(v.y), v.m]),
-        ev: activityLog.slice(-10),
+        ev: activityLog.slice(-10).map(e => ({ ts: e.ts, type: e.type, name: e.name })),
       }));
       break;
     }
