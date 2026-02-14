@@ -32,16 +32,77 @@ const gameConfig = {
   ejectMass: 18,       // mass of ejected pellet
   ejectSpeed: 25,      // speed of ejected pellet
   ejectLoss: 18,       // mass lost when ejecting
-  gameMode: 'default', // 'default' | 'laser'
+  gameMode: 'default', // 'default' | 'laser' | 'azoz'
   laserCooldown: 3,    // seconds between laser shots
   laserDamage: 15,     // mass removed per laser hit
   laserRange: 400,     // max laser range in world units
   bgMusic: 0,          // background music track index (-1=none, 0-19=track)
+  // ---- Azoz Mode Config ----
+  azozMapRatio: 1,           // x1: map adapt ratio (multiplier on total mass → world size)
+  azozMaxFoodMass: 5000,     // x2: max mass reachable from regular food
+  azozMushroomThreshold: 5000, // x3: min mass to consume red mushroom
+  azozMushroomFlash: 5,      // x4: seconds before despawn to start flashing
+  azozMushroomLifetime: 15,  // x5: seconds before mushroom despawns
+  azozMushroomName: 'Red Mushroom', // x6: display name for special food
+  redMushroom: false,        // x7: toggle red mushroom on/off (for non-azoz modes)
 };
 
 // ---- Grid Shapes (admin-drawn obstacles) ----
 let gridShapes = []; // { type: 'rect'|'circle', x, y, w?, h?, r?, color }
 const DEFAULT_GRID_CELL_SIZE = 50;
+
+// ---- Red Mushrooms (Azoz Mode special food) ----
+let mushrooms = []; // { id, x, y, spawnTime }
+let mushroomVer = 0;
+
+function spawnMushroom() {
+  const p = rp(100);
+  mushrooms.push({ id: uid(), x: p.x, y: p.y, spawnTime: Date.now() });
+  mushroomVer++;
+}
+
+function tickMushrooms() {
+  // Only active in azoz mode OR if redMushroom toggle is on
+  const mushroomActive = gameConfig.gameMode === 'azoz' || gameConfig.redMushroom;
+  if (!mushroomActive) {
+    if (mushrooms.length > 0) { mushrooms = []; mushroomVer++; }
+    return;
+  }
+  const now = Date.now();
+  const lifetime = gameConfig.azozMushroomLifetime * 1000;
+  // Remove expired mushrooms
+  const before = mushrooms.length;
+  mushrooms = mushrooms.filter(m => now - m.spawnTime < lifetime);
+  if (mushrooms.length !== before) mushroomVer++;
+  // Check if any player has reached threshold → spawn mushrooms occasionally
+  let anyBig = false;
+  for (const p of players.values()) {
+    if (tmass(p.cells) >= gameConfig.azozMushroomThreshold) { anyBig = true; break; }
+  }
+  // Spawn mushrooms less frequently than regular food: max 3 on map at a time
+  if (anyBig && mushrooms.length < 3 && Math.random() < 0.005) {
+    spawnMushroom();
+  }
+}
+
+// ---- Azoz Mode: Dynamic Map Sizing ----
+let azozBaseW = DEFAULT_W, azozBaseH = DEFAULT_H;
+
+function tickAzozMap() {
+  if (gameConfig.gameMode !== 'azoz') return;
+  let totalM = 0;
+  for (const p of players.values()) totalM += tmass(p.cells);
+  // Scale map based on total mass: base 4000 + ratio * sqrt(totalMass) * 10
+  const scale = gameConfig.azozMapRatio * Math.sqrt(totalM) * 10;
+  const newW = Math.max(2000, Math.min(20000, Math.round(azozBaseW + scale)));
+  const newH = Math.max(2000, Math.min(20000, Math.round(azozBaseH + scale)));
+  if (Math.abs(newW - W) > 50 || Math.abs(newH - H) > 50) {
+    gameConfig.gridW = newW;
+    gameConfig.gridH = newH;
+    applyGridSize();
+    broadcast(JSON.stringify({ t: 'gcfg', cfg: gameConfig, shapes: gridShapes }));
+  }
+}
 
 function applyGridSize() {
   W = gameConfig.gridW;
@@ -250,6 +311,7 @@ function tick() {
       }
     }
     // Decay & mass cap
+    const foodMassCap = (gameConfig.gameMode === 'azoz') ? gameConfig.azozMaxFoodMass : MAX_MASS;
     for (const cell of p.cells) {
       if (cell.m > gameConfig.decayMin) cell.m *= Math.pow(gameConfig.decayRate, dt);
       if (cell.m > MAX_MASS) cell.m = MAX_MASS;
@@ -273,6 +335,7 @@ function tick() {
 
   // ---- Food collisions — BOTS ONLY ----
   let foodEatenThisTick = 0;
+  const regFoodCap = (gameConfig.gameMode === 'azoz') ? gameConfig.azozMaxFoodMass : MAX_MASS;
   for (const p of players.values()) {
     if (!p.isBot) continue;
     for (const cell of p.cells) {
@@ -280,6 +343,8 @@ function tick() {
       for (let i = 0; i < food.length; i++) {
         const f = food[i], fdx = cell.x - f.x, fdy = cell.y - f.y;
         if (fdx * fdx + fdy * fdy < crSq) {
+          // In Azoz mode, regular food can't push past azozMaxFoodMass
+          if (cell.m >= regFoodCap) continue;
           cell.m += 1; foodEatenThisTick++;
           const np = rp(20); food[i] = { x: np.x, y: np.y, c: pick(FCLR) };
           foodChanged = true;
@@ -289,6 +354,28 @@ function tick() {
   }
   if (foodChanged) foodVer++;
   dbg.foodEaten = foodEatenThisTick;
+
+  // ---- Red Mushroom collisions — BOTS ONLY ----
+  const mushroomActive = gameConfig.gameMode === 'azoz' || gameConfig.redMushroom;
+  if (mushroomActive && mushrooms.length > 0) {
+    for (const p of players.values()) {
+      if (!p.isBot) continue;
+      const pm = tmass(p.cells);
+      if (pm < gameConfig.azozMushroomThreshold) continue;
+      for (const cell of p.cells) {
+        const cr = rad(cell.m);
+        for (let mi = mushrooms.length - 1; mi >= 0; mi--) {
+          const m = mushrooms[mi];
+          const d = dst(cell.x, cell.y, m.x, m.y);
+          if (d < cr) {
+            cell.m += 200; // mushroom gives significant mass
+            mushrooms.splice(mi, 1);
+            mushroomVer++;
+          }
+        }
+      }
+    }
+  }
 
   // ---- Virus collisions — all players ----
   let virusChanged = false;
@@ -362,6 +449,12 @@ function tick() {
       }
     }
   }
+
+  // ---- Red Mushroom tick (spawn/despawn) ----
+  tickMushrooms();
+
+  // ---- Azoz Mode: dynamic map sizing ----
+  tickAzozMap();
 }
 
 function doSplit(p) {
@@ -420,6 +513,7 @@ function mkLb() {
 }
 
 function serFood() { return food.map(f => [Math.round(f.x), Math.round(f.y), f.c]); }
+function serMushrooms() { return mushrooms.map(m => [m.id, Math.round(m.x), Math.round(m.y), m.spawnTime]); }
 
 // Safe send — prevents one bad connection from crashing broadcast loops
 function safeSend(ws, data) {
@@ -541,6 +635,7 @@ function handleMessage(ws, conn, msg) {
         cfg: gameConfig,
         shapes: gridShapes,
         v: viruses.map(v => [v.id, Math.round(v.x), Math.round(v.y), v.m]),
+        mush: serMushrooms(), mushVer: mushroomVer,
         ev: activityLog.slice(-10).map(e => ({ ts: e.ts, type: e.type, name: e.name })),
       }));
       break;
@@ -726,7 +821,9 @@ function handleMessage(ws, conn, msg) {
       if (!conn.isAdmin) return;
       const allowed = ['splitSpeed','splitDecel','wallKill','mergeDelay','decayRate','decayMin',
         'virusCount','virusMass','ejectMass','ejectSpeed','ejectLoss',
-        'gameMode','laserCooldown','laserDamage','laserRange','bgMusic'];
+        'gameMode','laserCooldown','laserDamage','laserRange','bgMusic',
+        'azozMapRatio','azozMaxFoodMass','azozMushroomThreshold','azozMushroomFlash',
+        'azozMushroomLifetime','azozMushroomName','redMushroom'];
       const oldVC = gameConfig.virusCount, oldVM = gameConfig.virusMass;
       for (const k of allowed) {
         if (msg[k] !== undefined) gameConfig[k] = msg[k];
@@ -734,6 +831,11 @@ function handleMessage(ws, conn, msg) {
       // Re-init viruses only if count or mass actually changed
       if (gameConfig.virusCount !== oldVC || gameConfig.virusMass !== oldVM) {
         initViruses();
+      }
+      // Track Azoz base dimensions when switching to azoz mode
+      if (gameConfig.gameMode === 'azoz') {
+        azozBaseW = DEFAULT_W;
+        azozBaseH = DEFAULT_H;
       }
       // Broadcast new config to all players
       broadcast(JSON.stringify({ t: 'cfg', cfg: gameConfig }));
@@ -832,6 +934,24 @@ function handleMessage(ws, conn, msg) {
       }
       break;
     }
+    // ---- Client Mushroom Eat Report ----
+    case 'me': {
+      if (!conn.playerId) return;
+      const p = players.get(conn.playerId);
+      if (!p || p.isBot) return;
+      const pm = tmass(p.cells);
+      if (pm < gameConfig.azozMushroomThreshold) return;
+      const mid = msg.mid; // mushroom id
+      const idx = mushrooms.findIndex(m => m.id === mid);
+      if (idx !== -1) {
+        // Give mass to the reporting player's largest cell
+        const largest = p.cells.reduce((a, b) => a.m > b.m ? a : b);
+        largest.m += 200;
+        mushrooms.splice(idx, 1);
+        mushroomVer++;
+      }
+      break;
+    }
   }
 }
 
@@ -843,6 +963,7 @@ const BROADCAST_RATE = 20;
 let tickCount = 0;
 let lastBroadcastFv = -1;
 let lastBroadcastVv = -1;
+let lastBroadcastMv = -1;
 
 setInterval(() => {
   const t0 = performance.now();
@@ -872,6 +993,12 @@ function broadcastState() {
   if (virusVer !== lastBroadcastVv) {
     state.v = viruses.map(v => [v.id, Math.round(v.x), Math.round(v.y), v.m]);
     lastBroadcastVv = virusVer;
+  }
+  // Include mushrooms when changed
+  if (mushroomVer !== lastBroadcastMv) {
+    state.mush = serMushrooms();
+    state.mushVer = mushroomVer;
+    lastBroadcastMv = mushroomVer;
   }
   // Include new activity events since last broadcast (strip IP for game clients)
   if (activityLog.length > lastBroadcastEvLen) {
