@@ -10,7 +10,7 @@ const ADMIN_PW = process.env.ADMIN_PW || 'changeme';
 
 // ---- Config ----
 const W = 4000, H = 4000, FOOD_N = 300;
-const SM = 10, SPLIT_MIN = 35, MAX_CELLS = 16, EAT_R = 1.25, BSPD = 5;
+const SM = 10, SPLIT_MIN = 35, MAX_CELLS = 16, EAT_R = 1.25, BSPD = 5, MAX_MASS = 100000;
 const CLR = ['#FF6B6B','#4ECDC4','#45B7D1','#96CEB4','#FFEAA7','#DDA0DD','#98D8C8','#F7DC6F','#BB8FCE','#85C1E9','#F8B500','#FF69B4'];
 const FCLR = ['#FF6B6B','#4ECDC4','#45B7D1','#96CEB4','#FFEAA7','#DDA0DD','#98D8C8','#F7DC6F'];
 
@@ -136,7 +136,7 @@ function tick() {
     // Feed bonus
     if (p.feedBonus > 0) {
       const chunk = Math.min(p.feedBonus, 20);
-      if (p.cells.length > 0) p.cells[0].m += chunk;
+      if (p.cells.length > 0) p.cells[0].m = Math.min(p.cells[0].m + chunk, MAX_MASS);
       p.feedBonus -= chunk;
     }
     // Move bots only (human positions come from client)
@@ -145,7 +145,7 @@ function tick() {
         const dx = p.mx - cell.x, dy = p.my - cell.y, d = Math.sqrt(dx * dx + dy * dy);
         if (d > 5) { const s = spd(cell.m) * dt; cell.x += (dx / d) * s; cell.y += (dy / d) * s; }
         const r = rad(cell.m);
-        cell.x = clp(cell.x, r, W - r); cell.y = clp(cell.y, r, H - r);
+        cell.x = clp(cell.x, r, Math.max(r, W - r)); cell.y = clp(cell.y, r, Math.max(r, H - r));
       }
     }
     // Merge/push own cells
@@ -156,8 +156,11 @@ function tick() {
         if (d < md && d > 0.1) { const o = (md - d) / d * 0.5, px = (b2.x - a.x) * o, py = (b2.y - a.y) * o; a.x -= px; a.y -= py; b2.x += px; b2.y += py; }
       }
     }
-    // Decay
-    for (const cell of p.cells) { if (cell.m > 200) cell.m *= Math.pow(0.9994, dt); }
+    // Decay & mass cap
+    for (const cell of p.cells) {
+      if (cell.m > 200) cell.m *= Math.pow(0.9994, dt);
+      if (cell.m > MAX_MASS) cell.m = MAX_MASS;
+    }
   }
 
   // ---- Food collisions — BOTS ONLY ----
@@ -359,7 +362,8 @@ function handleMessage(ws, conn, msg) {
           const cell = p.cells.find(c => c.id === cd[0]);
           if (cell) {
             cell.x = cd[1]; cell.y = cd[2];
-            if (typeof cd[3] === 'number' && cd[3] >= SM) cell.m = cd[3];
+            // Only accept mass if >= server value (prevents overwriting admin feed)
+            if (typeof cd[3] === 'number' && cd[3] >= cell.m) cell.m = Math.min(cd[3], MAX_MASS);
           }
         }
       }
