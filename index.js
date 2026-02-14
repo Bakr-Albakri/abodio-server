@@ -563,7 +563,7 @@ const server = http.createServer((req, res) => {
     let h = 0, b = 0;
     for (const p of players.values()) { if (p.isBot) b++; else h++; }
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ s: 'ok', h, b }));
+    res.end(JSON.stringify({ s: 'ok', h, b, paused: serverPaused }));
     return;
   }
   res.writeHead(404); res.end('Not Found');
