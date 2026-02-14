@@ -13,6 +13,7 @@ const DEFAULT_W = 4000, DEFAULT_H = 4000;
 let W = DEFAULT_W, H = DEFAULT_H;
 const FOOD_N = 300;
 const SM = 10, SPLIT_MIN = 35, MAX_CELLS = 16, EAT_R = 1.25, BSPD = 5, MAX_MASS = 100000;
+const VIRUS_N = 8, VIRUS_MASS = 100, EJECT_MASS = 18, EJECT_SPEED = 25, EJECT_LOSS = 18;
 const CLR = ['#FF6B6B','#4ECDC4','#45B7D1','#96CEB4','#FFEAA7','#DDA0DD','#98D8C8','#F7DC6F','#BB8FCE','#85C1E9','#F8B500','#FF69B4'];
 const FCLR = ['#FF6B6B','#4ECDC4','#45B7D1','#96CEB4','#FFEAA7','#DDA0DD','#98D8C8','#F7DC6F'];
 
@@ -70,7 +71,9 @@ function tmass(cells) { let s = 0; for (const c of cells) s += c.m; return s; }
 // ---- Game State ----
 const players = new Map(); // id -> PlayerData
 let food = [];
+let viruses = [];
 let foodVer = 0;
+let virusVer = 0;
 const kicked = new Map(); // lowercase name -> reason
 let gen = 1;
 let lastTick = Date.now();
@@ -80,10 +83,10 @@ const dbg = { tickMs: 0, serMs: 0, payloadBytes: 0, playerCount: 0, cellCount: 0
   foodEaten: 0, tickCount: 0, lastTickTime: 0, avgTickMs: 0, tickHistory: [] };
 
 // ---- Activity Log ----
-const activityLog = []; // { ts, type: 'join'|'leave', name }
+const activityLog = []; // { ts, type, name, device }
 let lastBroadcastEvLen = 0; // track what's been sent
-function logActivity(type, name) {
-  activityLog.push({ ts: Date.now(), type, name });
+function logActivity(type, name, device) {
+  activityLog.push({ ts: Date.now(), type, name, device: device || '' });
   if (activityLog.length > 200) {
     const trimmed = activityLog.length - 200;
     activityLog.splice(0, trimmed);
@@ -106,6 +109,17 @@ function initFood() {
   foodVer++;
 }
 initFood();
+
+// ---- Init Viruses ----
+function initViruses() {
+  viruses = [];
+  for (let i = 0; i < VIRUS_N; i++) {
+    const p = rp(200);
+    viruses.push({ id: uid(), x: p.x, y: p.y, m: VIRUS_MASS });
+  }
+  virusVer++;
+}
+initViruses();
 
 // ---- Device Detection ----
 function parseDevice(ua) {
@@ -215,11 +229,14 @@ function tick() {
     if (gameConfig.wallKill) {
       p.cells = p.cells.filter(c => c.m > 0);
     }
-    // Merge/push own cells
+    // Merge/push own cells (with merge delay)
     for (let i = 0; i < p.cells.length; i++) {
       for (let j = i + 1; j < p.cells.length; j++) {
         const a = p.cells[i], b2 = p.cells[j], d = dst(a.x, a.y, b2.x, b2.y), md = rad(a.m) + rad(b2.m);
-        if (d < md * 0.5 && p.cells.length > 1) { a.m += b2.m; p.cells.splice(j, 1); j--; continue; }
+        const canMerge = gameConfig.mergeDelay <= 0 ||
+          ((a.splitTime || 0) + gameConfig.mergeDelay * 1000 < Date.now() &&
+           (b2.splitTime || 0) + gameConfig.mergeDelay * 1000 < Date.now());
+        if (canMerge && d < md * 0.5 && p.cells.length > 1) { a.m += b2.m; p.cells.splice(j, 1); j--; continue; }
         if (d < md && d > 0.1) { const o = (md - d) / d * 0.5, px = (b2.x - a.x) * o, py = (b2.y - a.y) * o; a.x -= px; a.y -= py; b2.x += px; b2.y += py; }
       }
     }
@@ -230,8 +247,23 @@ function tick() {
     }
   }
 
+  // ---- Move ejected food ----
+  let foodChanged = false;
+  for (const f of food) {
+    if (f.ejVx || f.ejVy) {
+      f.x += (f.ejVx || 0) * dt;
+      f.y += (f.ejVy || 0) * dt;
+      f.ejVx = (f.ejVx || 0) * 0.85;
+      f.ejVy = (f.ejVy || 0) * 0.85;
+      if (Math.abs(f.ejVx) < 0.3 && Math.abs(f.ejVy) < 0.3) { f.ejVx = 0; f.ejVy = 0; }
+      f.x = clp(f.x, 5, W - 5);
+      f.y = clp(f.y, 5, H - 5);
+      foodChanged = true;
+    }
+  }
+
   // ---- Food collisions — BOTS ONLY ----
-  let foodChanged = false, foodEatenThisTick = 0;
+  let foodEatenThisTick = 0;
   for (const p of players.values()) {
     if (!p.isBot) continue;
     for (const cell of p.cells) {
@@ -248,6 +280,41 @@ function tick() {
   }
   if (foodChanged) foodVer++;
   dbg.foodEaten = foodEatenThisTick;
+
+  // ---- Virus collisions — all players ----
+  let virusChanged = false;
+  for (const p of players.values()) {
+    for (const cell of p.cells) {
+      for (let vi = viruses.length - 1; vi >= 0; vi--) {
+        const v = viruses[vi];
+        const d = dst(cell.x, cell.y, v.x, v.y);
+        if (cell.m > v.m && d < rad(cell.m) - rad(v.m) * 0.4) {
+          // Cell eats virus → split into many pieces
+          cell.m += v.m;
+          // Pop this cell into many small cells
+          const pieces = Math.min(MAX_CELLS - p.cells.length, Math.floor(cell.m / SPLIT_MIN));
+          if (pieces > 0) {
+            const pieceM = Math.floor(cell.m / (pieces + 1));
+            cell.m = pieceM;
+            for (let pi = 0; pi < pieces; pi++) {
+              const a = (Math.PI * 2 / pieces) * pi + Math.random() * 0.3;
+              p.cells.push({
+                id: uid(), x: cell.x, y: cell.y, m: pieceM, c: p.color,
+                vx: Math.cos(a) * gameConfig.splitSpeed * 1.2,
+                vy: Math.sin(a) * gameConfig.splitSpeed * 1.2,
+                splitTime: Date.now(),
+              });
+            }
+          }
+          // Respawn virus elsewhere
+          const np = rp(200);
+          viruses[vi] = { id: uid(), x: np.x, y: np.y, m: VIRUS_MASS };
+          virusChanged = true;
+        }
+      }
+    }
+  }
+  if (virusChanged) virusVer++;
 
   // ---- PvP — at least one side must be a bot ----
   const all = [];
@@ -289,10 +356,26 @@ function doSplit(p) {
         id: uid(), x: cell.x + Math.cos(a) * spawnDist, y: cell.y + Math.sin(a) * spawnDist,
         m: half, c: p.color,
         vx: Math.cos(a) * gameConfig.splitSpeed, vy: Math.sin(a) * gameConfig.splitSpeed,
+        splitTime: Date.now(),
       });
     }
   }
   p.cells.push(...news);
+}
+
+function doEject(p) {
+  const c = com(p.cells), ba = Math.atan2(p.my - c.y, p.mx - c.x);
+  for (const cell of p.cells) {
+    if (cell.m < EJECT_LOSS + 10) continue; // need enough mass
+    cell.m -= EJECT_LOSS;
+    const a = ba;
+    // Spawn ejected mass as small food pellet moving outward
+    const ex = cell.x + Math.cos(a) * (rad(cell.m) + 10);
+    const ey = cell.y + Math.sin(a) * (rad(cell.m) + 10);
+    food.push({ x: clp(ex, 20, W - 20), y: clp(ey, 20, H - 20), c: cell.c, ejVx: Math.cos(a) * EJECT_SPEED, ejVy: Math.sin(a) * EJECT_SPEED });
+    foodVer++;
+    break; // eject one per press
+  }
 }
 
 // ============================================================================
@@ -331,7 +414,7 @@ function sendAdminState(ws) {
     t: 'as', players: playerList, kicked: kickedList,
     foodCount: food.length, foodVer, gen,
     debug: { ...dbg, playerCount: players.size, cellCount: totalCells },
-    activity: activityLog.slice(-50),
+    activity: activityLog.slice(-100),
     cfg: gameConfig,
     shapes: gridShapes,
   }));
@@ -373,7 +456,7 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     if (conn.playerId) {
       const p = players.get(conn.playerId);
-      if (p) logActivity('leave', p.name);
+      if (p) logActivity('leave', p.name, p.device || '');
       players.delete(conn.playerId);
     }
     connections.delete(ws);
@@ -417,13 +500,15 @@ function handleMessage(ws, conn, msg) {
         mx: pos.x, my: pos.y, lastPing: Date.now(), device };
       players.set(id, p);
       conn.playerId = id;
-      logActivity('join', name);
+      logActivity('join', name, device);
       ws.send(JSON.stringify({
         t: 'w', id, mc: cell, w: W, h: H,
         f: serFood(), fv: foodVer, gen,
         p: serPlayers(), lb: mkLb(),
         cfg: gameConfig,
         shapes: gridShapes,
+        v: viruses.map(v => [v.id, Math.round(v.x), Math.round(v.y), v.m]),
+        ev: activityLog.slice(-10),
       }));
       break;
     }
@@ -452,11 +537,17 @@ function handleMessage(ws, conn, msg) {
       if (p) { p.lastPing = Date.now(); doSplit(p); }
       break;
     }
+    // ---- Eject Mass ----
+    case 'w': {
+      const p = players.get(conn.playerId);
+      if (p) { p.lastPing = Date.now(); doEject(p); }
+      break;
+    }
     // ---- Leave ----
     case 'l': {
       if (conn.playerId) {
         const p = players.get(conn.playerId);
-        if (p) logActivity('leave', p.name);
+        if (p) logActivity('leave', p.name, p.device || '');
         players.delete(conn.playerId);
         conn.playerId = null;
       }
@@ -476,7 +567,7 @@ function handleMessage(ws, conn, msg) {
     // ---- Admin Reset ----
     case 'ar': {
       if (!conn.isAdmin) return;
-      players.clear(); kicked.clear(); initFood(); gen++;
+      players.clear(); kicked.clear(); initFood(); initViruses(); gen++;
       ws.send(JSON.stringify({ t: 'am', ok: 1, action: 'admin_reset' }));
       break;
     }
@@ -591,7 +682,7 @@ function handleMessage(ws, conn, msg) {
           countdownInterval = null;
           countdown = null;
           // Reset the server
-          players.clear(); kicked.clear(); initFood(); gen++;
+          players.clear(); kicked.clear(); initFood(); initViruses(); gen++;
           const resetMsg = JSON.stringify({ t: 'cd', remaining: 0, reset: true });
           for (const [cws] of connections) { if (cws.readyState === 1) cws.send(resetMsg); }
         }
@@ -648,6 +739,7 @@ const TICK_RATE = 60;
 const BROADCAST_RATE = 20;
 let tickCount = 0;
 let lastBroadcastFv = -1;
+let lastBroadcastVv = -1;
 
 setInterval(() => {
   const t0 = performance.now();
@@ -673,6 +765,11 @@ function broadcastState() {
   const includeFood = foodVer !== lastBroadcastFv;
   const state = { t: 'u', p: sp, lb, fv: foodVer, gen };
   if (includeFood) { state.f = serFood(); lastBroadcastFv = foodVer; }
+  // Include viruses when changed
+  if (virusVer !== lastBroadcastVv) {
+    state.v = viruses.map(v => [v.id, Math.round(v.x), Math.round(v.y), v.m]);
+    lastBroadcastVv = virusVer;
+  }
   // Include new activity events since last broadcast
   if (activityLog.length > lastBroadcastEvLen) {
     state.ev = activityLog.slice(lastBroadcastEvLen);
