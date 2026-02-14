@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: abodio-server
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    autoDeploy: true
+    repo: https://github.com/Bakr-Albakri/abodio-server
+    branch: main
