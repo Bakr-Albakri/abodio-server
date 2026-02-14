@@ -43,6 +43,14 @@ let lastTick = Date.now();
 const dbg = { tickMs: 0, serMs: 0, payloadBytes: 0, playerCount: 0, cellCount: 0,
   foodEaten: 0, tickCount: 0, lastTickTime: 0, avgTickMs: 0, tickHistory: [] };
 
+// ---- Activity Log ----
+const activityLog = []; // { ts, type: 'join'|'leave', name }
+let lastBroadcastEvLen = 0; // track what's been sent
+function logActivity(type, name) {
+  activityLog.push({ ts: Date.now(), type, name });
+  if (activityLog.length > 200) activityLog.splice(0, activityLog.length - 200);
+}
+
 // ---- Connection Tracking ----
 // Map<ws, { playerId: string|null, isAdmin: boolean }>
 const connections = new Map();
@@ -247,6 +255,7 @@ function sendAdminState(ws) {
     t: 'as', players: playerList, kicked: kickedList,
     foodCount: food.length, foodVer, gen,
     debug: { ...dbg, playerCount: players.size, cellCount: totalCells },
+    activity: activityLog.slice(-50),
   }));
 }
 
@@ -284,7 +293,11 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
-    if (conn.playerId) players.delete(conn.playerId);
+    if (conn.playerId) {
+      const p = players.get(conn.playerId);
+      if (p) logActivity('leave', p.name);
+      players.delete(conn.playerId);
+    }
     connections.delete(ws);
   });
 
@@ -325,6 +338,7 @@ function handleMessage(ws, conn, msg) {
         mx: pos.x, my: pos.y, lastPing: Date.now(), device };
       players.set(id, p);
       conn.playerId = id;
+      logActivity('join', name);
       ws.send(JSON.stringify({
         t: 'w', id, mc: cell, w: W, h: H,
         f: serFood(), fv: foodVer, gen,
@@ -358,7 +372,12 @@ function handleMessage(ws, conn, msg) {
     }
     // ---- Leave ----
     case 'l': {
-      if (conn.playerId) { players.delete(conn.playerId); conn.playerId = null; }
+      if (conn.playerId) {
+        const p = players.get(conn.playerId);
+        if (p) logActivity('leave', p.name);
+        players.delete(conn.playerId);
+        conn.playerId = null;
+      }
       break;
     }
     // ---- Admin Auth ----
@@ -462,6 +481,11 @@ function broadcastState() {
   const includeFood = foodVer !== lastBroadcastFv;
   const state = { t: 'u', p: sp, lb, fv: foodVer, gen };
   if (includeFood) { state.f = serFood(); lastBroadcastFv = foodVer; }
+  // Include new activity events since last broadcast
+  if (activityLog.length > lastBroadcastEvLen) {
+    state.ev = activityLog.slice(lastBroadcastEvLen);
+    lastBroadcastEvLen = activityLog.length;
+  }
   const raw = JSON.stringify(state);
   dbg.payloadBytes = raw.length;
   for (const [ws, conn] of connections) {
