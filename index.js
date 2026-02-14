@@ -628,6 +628,10 @@ function handleMessage(ws, conn, msg) {
       players.set(id, p);
       conn.playerId = id;
       logActivity('join', name, device, conn.ip);
+      // Broadcast intro music to ALL players (everyone hears it when someone joins)
+      if (gameConfig.bgMusic >= 0) {
+        broadcast(JSON.stringify({ t: 'playMusic', track: gameConfig.bgMusic }));
+      }
       ws.send(JSON.stringify({
         t: 'w', id, mc: cell, w: W, h: H,
         f: serFood(), fv: foodVer, gen,
