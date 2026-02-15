@@ -280,11 +280,15 @@ const sgConfig = {
   graceSec: 20,
   matchDurationSec: 480,
   moveSpeed: 340, // units per second
+  jumpCooldownSec: 1.1,
+  jumpDurationMs: 540,
+  jumpImpulseSpeed: 540,
   attackCooldownMs: 700,
   attackRange: 130,
   attackFovDeg: 155,
   baseDamage: 22,
   knockback: 90,
+  attackLunge: 26,
   spawnInvulnSec: 2.5,
   soupHeal: 32,
   compassCooldownSec: 10,
@@ -313,6 +317,8 @@ const sgConfig = {
   mapSeed: 1337,
   mapPropDensity: 1,
   mapObstacleCount: 160,
+  mapLaneWidth: 118,
+  mapSizeVariance: 1,
   botFillEnabled: true,
   botFillTargetPlayers: 6,
   botFillMaxBots: 8,
@@ -650,6 +656,58 @@ function serSgPois() {
   return sgMap.pois.map(p => [p.id, p.name, Math.round(p.x), Math.round(p.y), p.tier | 0]);
 }
 
+function sgDistancePointToSegment(px, py, ax, ay, bx, by) {
+  const abx = bx - ax;
+  const aby = by - ay;
+  const apx = px - ax;
+  const apy = py - ay;
+  const ab2 = abx * abx + aby * aby;
+  if (ab2 <= 1e-6) return Math.hypot(apx, apy);
+  let t = (apx * abx + apy * aby) / ab2;
+  t = clp(t, 0, 1);
+  const qx = ax + abx * t;
+  const qy = ay + aby * t;
+  return Math.hypot(px - qx, py - qy);
+}
+
+function sgCarveMapLanes(props) {
+  if (!Array.isArray(props) || props.length === 0) return props;
+  const laneWidth = clp(Number(sgConfig.mapLaneWidth) || 118, 50, 280);
+  const kept = [];
+  for (const o of props) {
+    const proxy = o.shape === 'circle' ? o.r : Math.max(o.w, o.d) * 0.55;
+    let blocked = false;
+
+    // Ring path near the starting border to keep macro rotation fun.
+    const centerDist = dst(o.x, o.y, SG_CENTER.x, SG_CENTER.y);
+    const ringRadius = clp(Number(sgConfig.borderStartRadius) || 2300, 600, 2800);
+    if (Math.abs(centerDist - ringRadius * 0.74) < laneWidth * 0.64 + proxy * 0.42) {
+      blocked = true;
+    }
+
+    // Primary lanes from center toward each POI.
+    if (!blocked) {
+      for (const p of SG_POI_BLUEPRINTS) {
+        const d = sgDistancePointToSegment(o.x, o.y, SG_CENTER.x, SG_CENTER.y, p.x, p.y);
+        if (d < laneWidth + proxy * 0.52) {
+          blocked = true;
+          break;
+        }
+      }
+    }
+
+    // Cardinal crossing lanes for reliable fallback pathing.
+    if (!blocked) {
+      const inX = Math.abs(o.x - SG_CENTER.x) < laneWidth * 0.7 + proxy * 0.42;
+      const inY = Math.abs(o.y - SG_CENTER.y) < laneWidth * 0.7 + proxy * 0.42;
+      if (inX || inY) blocked = true;
+    }
+
+    if (!blocked) kept.push(o);
+  }
+  return kept;
+}
+
 function sgGenerateMap(seedInput) {
   const seed = (Math.abs(Math.floor(seedInput ?? sgConfig.mapSeed ?? 1337)) >>> 0) || 1;
   const rnd = sgMkRng(seed);
@@ -667,6 +725,8 @@ function sgGenerateMap(seedInput) {
   const targetCountBase = Number(sgConfig.mapObstacleCount) || 160;
   const density = Number(sgConfig.mapPropDensity) || 1;
   const targetCount = clp(Math.round(targetCountBase * density), 40, 500);
+  const sizeVariance = clp(Number(sgConfig.mapSizeVariance) || 1, 0.5, 1.8);
+  const densityScale = clp(1 + (density - 1) * 0.22, 0.74, 1.4);
   const props = [];
   let attempts = 0;
   while (props.length < targetCount && attempts < targetCount * 32) {
@@ -676,9 +736,9 @@ function sgGenerateMap(seedInput) {
     const y = SG_MAP_MIN_EDGE + rnd() * (SG_H - SG_MAP_MIN_EDGE * 2);
     const h = circle ? 14 + rnd() * 24 : 18 + rnd() * 34;
     const kind = Math.floor(rnd() * 6);
-    let rawR = circle ? 24 + rnd() * 54 : 0;
-    let rawW = circle ? 0 : 38 + rnd() * 108;
-    let rawD = circle ? 0 : 38 + rnd() * 108;
+    let rawR = circle ? (24 + rnd() * 54) * sizeVariance * densityScale : 0;
+    let rawW = circle ? 0 : (38 + rnd() * 108) * sizeVariance * densityScale;
+    let rawD = circle ? 0 : (38 + rnd() * 108) * sizeVariance * densityScale;
     const proxyR = circle ? rawR : Math.max(rawW, rawD) * 0.58;
 
     let blocked = false;
@@ -691,7 +751,7 @@ function sgGenerateMap(seedInput) {
     const recent = props.slice(-50);
     for (const o of recent) {
       const oProxy = o.shape === 'circle' ? o.r : Math.max(o.w, o.d) * 0.58;
-      if (dst(x, y, o.x, o.y) < (proxyR + oProxy) * 0.8) { blocked = true; break; }
+      if (dst(x, y, o.x, o.y) < (proxyR + oProxy) * 0.74) { blocked = true; break; }
     }
     if (blocked) continue;
 
@@ -701,8 +761,44 @@ function sgGenerateMap(seedInput) {
       props.push({ id: `m-${props.length}`, shape: 'rect', x, y, w: rawW, d: rawD, h, kind });
     }
   }
+  let carved = sgCarveMapLanes(props);
+  // Backfill if carving became too aggressive, while keeping lanes mostly clear.
+  const minKept = Math.max(30, Math.floor(targetCount * 0.72));
+  let refillAttempts = 0;
+  while (carved.length < minKept && refillAttempts < targetCount * 24) {
+    refillAttempts++;
+    const circle = rnd() < 0.6;
+    const x = SG_MAP_MIN_EDGE + rnd() * (SG_W - SG_MAP_MIN_EDGE * 2);
+    const y = SG_MAP_MIN_EDGE + rnd() * (SG_H - SG_MAP_MIN_EDGE * 2);
+    const r = (18 + rnd() * 30) * sizeVariance * 0.78;
+    const w = (30 + rnd() * 70) * sizeVariance * 0.72;
+    const d = (30 + rnd() * 70) * sizeVariance * 0.72;
+    const h = 10 + rnd() * 20;
+    const kind = Math.floor(rnd() * 6);
+    const o = circle
+      ? { id: `m-b-${carved.length}-${refillAttempts}`, shape: 'circle', x, y, r, h, kind }
+      : { id: `m-b-${carved.length}-${refillAttempts}`, shape: 'rect', x, y, w, d, h, kind };
+    const laneCheck = sgCarveMapLanes([o]);
+    if (laneCheck.length === 0) continue;
+    let collide = false;
+    const proxy = circle ? r : Math.max(w, d) * 0.58;
+    for (const prev of carved.slice(-120)) {
+      const pProxy = prev.shape === 'circle' ? prev.r : Math.max(prev.w, prev.d) * 0.58;
+      if (dst(o.x, o.y, prev.x, prev.y) < (proxy + pProxy) * 0.74) {
+        collide = true;
+        break;
+      }
+    }
+    if (collide) continue;
+    carved.push(o);
+  }
 
-  sgMap = { seed, props, pois };
+  // Normalize IDs after lane carving/backfill.
+  for (let i = 0; i < carved.length; i++) {
+    carved[i].id = `m-${i}`;
+  }
+
+  sgMap = { seed, props: carved, pois };
   sgMapVer++;
   sgRebuildMapGrid();
 }
@@ -1110,6 +1206,12 @@ function sgSpawnBot() {
     nextCompassAt: 0,
     nextSneakyAt: 0,
     nextWeightlessAt: 0,
+    jumpUntil: 0,
+    jumpStartedAt: 0,
+    jumpCdUntil: 0,
+    jumpImpulseUntil: 0,
+    jumpImpulseX: 0,
+    jumpImpulseY: 0,
     furyUntil: 0,
     fortifyUntil: 0,
     swiftUntil: 0,
@@ -1230,9 +1332,11 @@ function sgUpdateBotAI(now) {
 
     const nearest = sgFindNearestEnemy(p);
     if (nearest && nearest.dist < Math.max(90, Number(sgConfig.attackRange) * 1.03)) {
+      if (nearest.dist > 85 && nearest.dist < 260 && Math.random() < 0.032 * diff) sgTryJump(p);
       sgTryAttack(p);
     } else if (Math.random() < 0.011 * diff) {
       sgTryOpenChest(p);
+      if (Math.random() < 0.18 * diff) sgTryJump(p);
     }
   }
 }
@@ -1319,6 +1423,12 @@ function sgResetPlayerForRound(p) {
   p.nextCompassAt = 0;
   p.nextSneakyAt = 0;
   p.nextWeightlessAt = 0;
+  p.jumpUntil = 0;
+  p.jumpStartedAt = 0;
+  p.jumpCdUntil = 0;
+  p.jumpImpulseUntil = 0;
+  p.jumpImpulseX = 0;
+  p.jumpImpulseY = 0;
   p.furyUntil = 0;
   p.fortifyUntil = 0;
   p.swiftUntil = 0;
@@ -1351,6 +1461,12 @@ function sgSetSpectator(p) {
   p.nextCompassAt = 0;
   p.nextSneakyAt = 0;
   p.nextWeightlessAt = 0;
+  p.jumpUntil = 0;
+  p.jumpStartedAt = 0;
+  p.jumpCdUntil = 0;
+  p.jumpImpulseUntil = 0;
+  p.jumpImpulseX = 0;
+  p.jumpImpulseY = 0;
   p.furyUntil = 0;
   p.fortifyUntil = 0;
   p.swiftUntil = 0;
@@ -1495,6 +1611,12 @@ function sgKillPlayer(victim, killer, cause) {
   victim.hp = 0;
   victim.invisUntil = 0;
   victim.speedUntil = 0;
+  victim.jumpUntil = 0;
+  victim.jumpStartedAt = 0;
+  victim.jumpCdUntil = 0;
+  victim.jumpImpulseUntil = 0;
+  victim.jumpImpulseX = 0;
+  victim.jumpImpulseY = 0;
   victim.furyUntil = 0;
   victim.fortifyUntil = 0;
   victim.swiftUntil = 0;
@@ -1598,6 +1720,36 @@ function sgTryAbility(player, ability) {
   return false;
 }
 
+function sgTryJump(player) {
+  const now = Date.now();
+  if (!player || !player.alive || player.spectator) return false;
+  if (sgMatch.phase !== 'lobby' && sgMatch.phase !== 'countdown' && sgMatch.phase !== 'running') return false;
+  if (now < (player.jumpCdUntil || 0)) return false;
+
+  const jumpDurationMs = clp(Math.round(Number(sgConfig.jumpDurationMs) || 540), 180, 1500);
+  const jumpCdMs = clp(Math.round((Number(sgConfig.jumpCooldownSec) || 1.1) * 1000), 200, 5000);
+  let ix = Number(player.mx) || 0;
+  let iy = Number(player.my) || 0;
+  const mag = Math.hypot(ix, iy);
+  if (mag > 1e-3) {
+    ix /= mag;
+    iy /= mag;
+  } else {
+    const f = Number.isFinite(player.face) ? player.face : 0;
+    ix = Math.cos(f);
+    iy = Math.sin(f);
+  }
+
+  player.jumpStartedAt = now;
+  player.jumpUntil = now + jumpDurationMs;
+  player.jumpCdUntil = now + jumpCdMs;
+  player.jumpImpulseUntil = now + Math.floor(jumpDurationMs * 0.48);
+  player.jumpImpulseX = ix;
+  player.jumpImpulseY = iy;
+  if (now < (player.invisUntil || 0)) player.invisUntil = 0;
+  return true;
+}
+
 function sgTryAttack(attacker) {
   const now = Date.now();
   if (sgMatch.phase !== 'running') return;
@@ -1626,6 +1778,19 @@ function sgTryAttack(attacker) {
     if (d < range && d < best) { best = d; target = p; }
   }
   if (!target) return;
+
+  const lunge = clp(Number(sgConfig.attackLunge) || 26, 0, 120);
+  if (lunge > 0) {
+    const lx = target.x - attacker.x;
+    const ly = target.y - attacker.y;
+    const lm = Math.hypot(lx, ly);
+    if (lm > 1e-4) {
+      attacker.x += (lx / lm) * lunge;
+      attacker.y += (ly / lm) * lunge;
+      sgClampPos(attacker);
+      sgResolveMapCollision(attacker, 18);
+    }
+  }
 
   const baseDamage = Number(sgConfig.baseDamage) || 22;
   const furyBoost = sgPlayerHasBuff(attacker, 'fury', now) ? 1.28 : 1;
@@ -1834,13 +1999,19 @@ function sgTick() {
         p.x += nx * sgConfig.moveSpeed * speedMult * dtSec;
         p.y += ny * sgConfig.moveSpeed * speedMult * dtSec;
       }
+      if (now < (p.jumpImpulseUntil || 0)) {
+        const jumpImpulse = clp(Number(sgConfig.jumpImpulseSpeed) || 540, 120, 1800);
+        p.x += (p.jumpImpulseX || 0) * jumpImpulse * dtSec;
+        p.y += (p.jumpImpulseY || 0) * jumpImpulse * dtSec;
+      }
       sgResolveMapCollision(p, 18);
       sgClampPos(p);
       if (sgMatch.phase === 'running') {
         const dd = dst(p.x, p.y, SG_CENTER.x, SG_CENTER.y);
         if (dd > sgMatch.borderRadius) {
           const fortifyMitigation = sgPlayerHasBuff(p, 'fortify', now) ? 0.78 : 1;
-          p.hp -= sgConfig.borderDamagePerSec * fortifyMitigation * dtSec;
+          const jumpMitigation = now < (p.jumpUntil || 0) ? 0.82 : 1;
+          p.hp -= sgConfig.borderDamagePerSec * fortifyMitigation * jumpMitigation * dtSec;
           p.lastDamagedAt = now;
           if (p.hp <= 0) sgKillPlayer(p, null, 'border');
         }
@@ -1927,6 +2098,9 @@ function serSgPlayers() {
       p.nextSneakyAt || 0,
       p.nextWeightlessAt || 0,
       p.isBot ? 1 : 0,
+      p.jumpUntil || 0,
+      p.jumpStartedAt || 0,
+      p.jumpCdUntil || 0,
       p.furyUntil || 0,
       p.fortifyUntil || 0,
       p.swiftUntil || 0,
@@ -2003,6 +2177,9 @@ function sendSurvivalAdminState(ws) {
       nextCompassAt: p.nextCompassAt || 0,
       nextSneakyAt: p.nextSneakyAt || 0,
       nextWeightlessAt: p.nextWeightlessAt || 0,
+      jumpUntil: p.jumpUntil || 0,
+      jumpStartedAt: p.jumpStartedAt || 0,
+      jumpCdUntil: p.jumpCdUntil || 0,
       furyUntil: p.furyUntil || 0,
       fortifyUntil: p.fortifyUntil || 0,
       swiftUntil: p.swiftUntil || 0,
@@ -2491,6 +2668,12 @@ function sgJoin(ws, conn, msg) {
     nextCompassAt: 0,
     nextSneakyAt: 0,
     nextWeightlessAt: 0,
+    jumpUntil: 0,
+    jumpStartedAt: 0,
+    jumpCdUntil: 0,
+    jumpImpulseUntil: 0,
+    jumpImpulseX: 0,
+    jumpImpulseY: 0,
     furyUntil: 0,
     fortifyUntil: 0,
     swiftUntil: 0,
@@ -2560,16 +2743,19 @@ function sgUpdateConfig(msg) {
   const prevMapSeed = sgConfig.mapSeed;
   const prevMapDensity = sgConfig.mapPropDensity;
   const prevMapObstacleCount = sgConfig.mapObstacleCount;
+  const prevMapLaneWidth = sgConfig.mapLaneWidth;
+  const prevMapSizeVariance = sgConfig.mapSizeVariance;
   const prevShrineEnabled = !!sgConfig.shrineEnabled;
   const prevShrineCount = Number(sgConfig.shrineCount) || 0;
   const prevShrineRadius = Number(sgConfig.shrineRadius) || 0;
   const numeric = [
     'minPlayersToStart', 'countdownSec', 'graceSec', 'matchDurationSec',
-    'moveSpeed', 'attackCooldownMs', 'attackRange', 'attackFovDeg', 'baseDamage', 'knockback', 'spawnInvulnSec',
+    'moveSpeed', 'jumpCooldownSec', 'jumpDurationMs', 'jumpImpulseSpeed',
+    'attackCooldownMs', 'attackRange', 'attackFovDeg', 'baseDamage', 'knockback', 'attackLunge', 'spawnInvulnSec',
     'soupHeal', 'compassCooldownSec', 'invisDurationSec', 'invisCooldownSec',
     'speedBoostMultiplier', 'speedBoostDurationSec', 'speedBoostCooldownSec',
     'feastTimeSec', 'feastAnnounceLeadSec', 'feastChestCount',
-    'mapSeed', 'mapPropDensity', 'mapObstacleCount',
+    'mapSeed', 'mapPropDensity', 'mapObstacleCount', 'mapLaneWidth', 'mapSizeVariance',
     'botFillTargetPlayers', 'botFillMaxBots', 'botDifficulty',
     'relicSpawnIntervalSec', 'relicLifetimeSec', 'relicMaxActive', 'relicPickupRange',
     'shrineCount', 'shrineRadius', 'shrineBuffSec', 'shrineCooldownSec',
@@ -2597,11 +2783,15 @@ function sgUpdateConfig(msg) {
   sgConfig.graceSec = clp(Math.round(sgConfig.graceSec), 0, 120);
   sgConfig.matchDurationSec = clp(Math.round(sgConfig.matchDurationSec), 30, 1800);
   sgConfig.moveSpeed = clp(sgConfig.moveSpeed, 80, 1200);
+  sgConfig.jumpCooldownSec = clp(sgConfig.jumpCooldownSec, 0.2, 5);
+  sgConfig.jumpDurationMs = clp(Math.round(sgConfig.jumpDurationMs), 180, 1500);
+  sgConfig.jumpImpulseSpeed = clp(sgConfig.jumpImpulseSpeed, 120, 1800);
   sgConfig.attackCooldownMs = clp(Math.round(sgConfig.attackCooldownMs), 150, 5000);
   sgConfig.attackRange = clp(sgConfig.attackRange, 30, 400);
   sgConfig.attackFovDeg = clp(sgConfig.attackFovDeg, 20, 360);
   sgConfig.baseDamage = clp(sgConfig.baseDamage, 1, 120);
   sgConfig.knockback = clp(sgConfig.knockback, 0, 400);
+  sgConfig.attackLunge = clp(sgConfig.attackLunge, 0, 120);
   sgConfig.spawnInvulnSec = clp(sgConfig.spawnInvulnSec, 0, 20);
   sgConfig.soupHeal = clp(sgConfig.soupHeal, 1, 100);
   sgConfig.compassCooldownSec = clp(Math.round(sgConfig.compassCooldownSec), 1, 120);
@@ -2616,6 +2806,8 @@ function sgUpdateConfig(msg) {
   sgConfig.mapSeed = Math.max(1, Math.floor(Math.abs(sgConfig.mapSeed || 1337)));
   sgConfig.mapPropDensity = clp(sgConfig.mapPropDensity, 0.35, 2.8);
   sgConfig.mapObstacleCount = clp(Math.round(sgConfig.mapObstacleCount), 40, 500);
+  sgConfig.mapLaneWidth = clp(Math.round(sgConfig.mapLaneWidth), 50, 280);
+  sgConfig.mapSizeVariance = clp(sgConfig.mapSizeVariance, 0.5, 1.8);
   sgConfig.botFillTargetPlayers = clp(Math.round(sgConfig.botFillTargetPlayers), 1, 30);
   sgConfig.botFillMaxBots = clp(Math.round(sgConfig.botFillMaxBots), 0, 20);
   sgConfig.botDifficulty = clp(sgConfig.botDifficulty, 0.2, 3);
@@ -2648,7 +2840,9 @@ function sgUpdateConfig(msg) {
 
   const mapChanged = sgConfig.mapSeed !== prevMapSeed ||
     Math.abs((sgConfig.mapPropDensity || 0) - (prevMapDensity || 0)) > 1e-9 ||
-    sgConfig.mapObstacleCount !== prevMapObstacleCount;
+    sgConfig.mapObstacleCount !== prevMapObstacleCount ||
+    sgConfig.mapLaneWidth !== prevMapLaneWidth ||
+    Math.abs((sgConfig.mapSizeVariance || 0) - (prevMapSizeVariance || 0)) > 1e-9;
   if (mapChanged) {
     sgGenerateMap(sgConfig.mapSeed);
     sgBuildShrines();
@@ -2691,6 +2885,12 @@ function handleMessage(ws, conn, msg) {
     case 'sgatk': {
       if (!conn.sgPlayerId) break;
       sgTryAttack(sgPlayers.get(conn.sgPlayerId));
+      break;
+    }
+    // ---- Survival Games Jump ----
+    case 'sgjump': {
+      if (!conn.sgPlayerId) break;
+      sgTryJump(sgPlayers.get(conn.sgPlayerId));
       break;
     }
     // ---- Survival Games Compass ----
