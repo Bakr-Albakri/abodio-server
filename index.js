@@ -266,6 +266,458 @@ function parseDevice(ua) {
 }
 
 // ============================================================================
+// SURVIVAL GAMES (Mineplex-inspired mode)
+// ============================================================================
+const SG_W = 5200;
+const SG_H = 5200;
+const SG_CENTER = { x: SG_W / 2, y: SG_H / 2 };
+const SG_MAX_HP = 100;
+const SG_IDLE_TIMEOUT_MS = 30000;
+
+const sgConfig = {
+  minPlayersToStart: 2,
+  countdownSec: 12,
+  graceSec: 20,
+  matchDurationSec: 480,
+  moveSpeed: 340, // units per second
+  attackCooldownMs: 700,
+  attackRange: 130,
+  baseDamage: 22,
+  borderStartRadius: 2300,
+  borderEndRadius: 500,
+  borderShrinkDelaySec: 90,
+  borderShrinkDurationSec: 240,
+  borderDamagePerSec: 16,
+  chestOpenRange: 95,
+  chestRefillSec: 75,
+  weaponMaxTier: 4,
+  armorMaxTier: 3,
+  lateJoinAsSpectator: true,
+  autoResetSec: 12,
+};
+
+const sgPlayers = new Map(); // id -> SGPlayer
+let sgGen = 1;
+let sgLastTick = Date.now();
+let sgChestVer = 0;
+let sgLastEventBroadcastLen = 0;
+const sgEvents = []; // { ts, type, msg }
+const sgMatch = {
+  phase: 'lobby', // lobby | countdown | running | ended
+  countdownEndsAt: 0,
+  startedAt: 0,
+  endsAt: 0,
+  endedAt: 0,
+  winnerId: null,
+  endReason: '',
+  borderRadius: 2300,
+};
+
+const SG_CHEST_POINTS = [
+  { x: 2600, y: 2600 }, { x: 2600, y: 900 }, { x: 2600, y: 4300 }, { x: 900, y: 2600 }, { x: 4300, y: 2600 },
+  { x: 1350, y: 1350 }, { x: 3850, y: 1350 }, { x: 1350, y: 3850 }, { x: 3850, y: 3850 },
+  { x: 2600, y: 1400 }, { x: 2600, y: 3800 }, { x: 1400, y: 2600 }, { x: 3800, y: 2600 },
+  { x: 1000, y: 1700 }, { x: 1700, y: 1000 }, { x: 4200, y: 1700 }, { x: 3500, y: 1000 },
+  { x: 1000, y: 3500 }, { x: 1700, y: 4200 }, { x: 4200, y: 3500 }, { x: 3500, y: 4200 },
+];
+let sgChests = [];
+
+function sgLog(type, msg) {
+  sgEvents.push({ ts: Date.now(), type, msg: String(msg || '').slice(0, 140) });
+  if (sgEvents.length > 200) {
+    const trimmed = sgEvents.length - 200;
+    sgEvents.splice(0, trimmed);
+    sgLastEventBroadcastLen = Math.max(0, sgLastEventBroadcastLen - trimmed);
+  }
+}
+
+function initSurvivalChests() {
+  sgChests = SG_CHEST_POINTS.map((p, i) => ({
+    id: `c-${i}`,
+    x: p.x,
+    y: p.y,
+    openedAt: 0,
+    nextRefillAt: 0,
+  }));
+  sgChestVer++;
+}
+initSurvivalChests();
+
+function sgAlivePlayers() {
+  const out = [];
+  for (const p of sgPlayers.values()) {
+    if (!p.spectator && p.alive) out.push(p);
+  }
+  return out;
+}
+
+function sgActivePlayers() {
+  const out = [];
+  for (const p of sgPlayers.values()) {
+    if (!p.spectator) out.push(p);
+  }
+  return out;
+}
+
+function sgClampPos(p) {
+  p.x = clp(p.x, 20, SG_W - 20);
+  p.y = clp(p.y, 20, SG_H - 20);
+}
+
+function sgPickSpawn() {
+  const alive = sgAlivePlayers();
+  let best = null;
+  for (let i = 0; i < 24; i++) {
+    const a = (Math.PI * 2 * i) / 24;
+    const r = 1800;
+    const candidate = { x: SG_CENTER.x + Math.cos(a) * r, y: SG_CENTER.y + Math.sin(a) * r };
+    let minD = Infinity;
+    for (const p of alive) minD = Math.min(minD, dst(candidate.x, candidate.y, p.x, p.y));
+    if (!best || minD > best.minD) best = { ...candidate, minD };
+  }
+  return best ? { x: best.x, y: best.y } : { x: SG_CENTER.x, y: SG_CENTER.y };
+}
+
+function sgResetPlayerForRound(p) {
+  const spawn = sgPickSpawn();
+  p.x = spawn.x;
+  p.y = spawn.y;
+  p.mx = 0;
+  p.my = 0;
+  p.face = 0;
+  p.alive = true;
+  p.spectator = false;
+  p.hp = SG_MAX_HP;
+  p.weaponTier = 0;
+  p.armorTier = 0;
+  p.invulnUntil = Date.now() + 1200;
+  p.lastAttack = 0;
+}
+
+function sgSetSpectator(p) {
+  p.x = SG_CENTER.x;
+  p.y = SG_CENTER.y;
+  p.mx = 0;
+  p.my = 0;
+  p.face = 0;
+  p.alive = false;
+  p.spectator = true;
+  p.hp = 0;
+  p.weaponTier = 0;
+  p.armorTier = 0;
+  p.invulnUntil = 0;
+}
+
+function sgResetRound(keepPlayers = true) {
+  sgMatch.phase = 'lobby';
+  sgMatch.countdownEndsAt = 0;
+  sgMatch.startedAt = 0;
+  sgMatch.endsAt = 0;
+  sgMatch.endedAt = 0;
+  sgMatch.winnerId = null;
+  sgMatch.endReason = '';
+  sgMatch.borderRadius = sgConfig.borderStartRadius;
+  sgGen++;
+  initSurvivalChests();
+  if (!keepPlayers) {
+    sgPlayers.clear();
+    return;
+  }
+  for (const p of sgPlayers.values()) sgResetPlayerForRound(p);
+}
+
+function sgStartCountdown() {
+  if (sgMatch.phase !== 'lobby') return;
+  sgMatch.phase = 'countdown';
+  sgMatch.countdownEndsAt = Date.now() + sgConfig.countdownSec * 1000;
+  sgLog('system', `Survival Games starts in ${sgConfig.countdownSec}s`);
+}
+
+function sgStartMatch() {
+  sgMatch.phase = 'running';
+  sgMatch.startedAt = Date.now();
+  sgMatch.endsAt = sgMatch.startedAt + sgConfig.matchDurationSec * 1000;
+  sgMatch.endedAt = 0;
+  sgMatch.winnerId = null;
+  sgMatch.endReason = '';
+  sgMatch.borderRadius = sgConfig.borderStartRadius;
+  for (const p of sgPlayers.values()) {
+    if (!p.spectator) sgResetPlayerForRound(p);
+    else sgSetSpectator(p);
+  }
+  sgLog('system', 'Survival Games match started');
+}
+
+function sgEndMatch(winnerId, reason) {
+  if (sgMatch.phase === 'ended') return;
+  sgMatch.phase = 'ended';
+  sgMatch.endedAt = Date.now();
+  sgMatch.winnerId = winnerId || null;
+  sgMatch.endReason = String(reason || '').slice(0, 60);
+  if (winnerId && sgPlayers.has(winnerId)) {
+    sgLog('system', `Winner: ${sgPlayers.get(winnerId).name}`);
+  } else {
+    sgLog('system', 'Match ended with no winner');
+  }
+}
+
+function sgUpdateBorder(now) {
+  if (sgMatch.phase !== 'running') return;
+  const elapsed = (now - sgMatch.startedAt) / 1000;
+  const startR = Math.max(300, Number(sgConfig.borderStartRadius) || 2300);
+  const endR = Math.max(120, Math.min(startR, Number(sgConfig.borderEndRadius) || 500));
+  const delay = Math.max(0, Number(sgConfig.borderShrinkDelaySec) || 0);
+  const duration = Math.max(1, Number(sgConfig.borderShrinkDurationSec) || 1);
+  if (elapsed <= delay) {
+    sgMatch.borderRadius = startR;
+    return;
+  }
+  if (elapsed >= delay + duration) {
+    sgMatch.borderRadius = endR;
+    return;
+  }
+  const t = (elapsed - delay) / duration;
+  sgMatch.borderRadius = startR + (endR - startR) * t;
+}
+
+function sgKillPlayer(victim, killer, cause) {
+  if (!victim.alive) return;
+  victim.alive = false;
+  victim.hp = 0;
+  victim.deaths = (victim.deaths || 0) + 1;
+  if (killer && killer.id !== victim.id) killer.kills = (killer.kills || 0) + 1;
+  const by = killer && killer.id !== victim.id ? `${killer.name}` : 'Environment';
+  sgLog('death', `${victim.name} was eliminated by ${by}${cause ? ` (${cause})` : ''}`);
+}
+
+function sgTryAttack(attacker) {
+  const now = Date.now();
+  if (sgMatch.phase !== 'running') return;
+  if (!attacker || !attacker.alive || attacker.spectator) return;
+  if (now < attacker.invulnUntil) return;
+  if (now - (attacker.lastAttack || 0) < sgConfig.attackCooldownMs) return;
+  if (now < sgMatch.startedAt + sgConfig.graceSec * 1000) return;
+  attacker.lastAttack = now;
+
+  const range = Math.max(40, Number(sgConfig.attackRange) || 130);
+  let target = null;
+  let best = Infinity;
+  for (const p of sgPlayers.values()) {
+    if (p.id === attacker.id || !p.alive || p.spectator) continue;
+    if (now < p.invulnUntil) continue;
+    const d = dst(attacker.x, attacker.y, p.x, p.y);
+    if (d < range && d < best) { best = d; target = p; }
+  }
+  if (!target) return;
+
+  const raw = (Number(sgConfig.baseDamage) || 22) + attacker.weaponTier * 7 - target.armorTier * 5;
+  const dmg = clp(raw, 5, 80);
+  target.hp -= dmg;
+  if (target.hp <= 0) sgKillPlayer(target, attacker, 'melee');
+}
+
+function sgTryOpenChest(player) {
+  const now = Date.now();
+  if (!player || !player.alive || player.spectator) return false;
+  const openRange = Math.max(30, Number(sgConfig.chestOpenRange) || 95);
+  let chest = null;
+  let best = Infinity;
+  for (const c of sgChests) {
+    if (c.openedAt && now < c.nextRefillAt) continue;
+    const d = dst(player.x, player.y, c.x, c.y);
+    if (d < openRange && d < best) { best = d; chest = c; }
+  }
+  if (!chest) return false;
+
+  chest.openedAt = now;
+  chest.nextRefillAt = now + Math.max(10, Number(sgConfig.chestRefillSec) || 75) * 1000;
+  sgChestVer++;
+
+  const heal = 8 + Math.floor(Math.random() * 22);
+  if (Math.random() < 0.55) player.weaponTier = clp(player.weaponTier + 1, 0, sgConfig.weaponMaxTier);
+  if (Math.random() < 0.4) player.armorTier = clp(player.armorTier + 1, 0, sgConfig.armorMaxTier);
+  player.hp = clp(player.hp + heal, 1, SG_MAX_HP);
+  sgLog('loot', `${player.name} opened a chest`);
+  return true;
+}
+
+function sgTick() {
+  const now = Date.now();
+  let dms = now - sgLastTick;
+  if (dms < 15) return;
+  if (dms > 500) dms = 500;
+  sgLastTick = now;
+  const dtSec = dms / 1000;
+
+  // Remove stale/idle players.
+  for (const [id, p] of sgPlayers) {
+    if (now - (p.lastPing || now) > SG_IDLE_TIMEOUT_MS) {
+      sgPlayers.delete(id);
+      sgLog('leave', `${p.name} timed out`);
+    }
+  }
+
+  // Refill chests.
+  for (const c of sgChests) {
+    if (c.openedAt && now >= c.nextRefillAt) {
+      c.openedAt = 0;
+      c.nextRefillAt = 0;
+      sgChestVer++;
+    }
+  }
+
+  const activePlayers = sgActivePlayers();
+  if (sgMatch.phase === 'lobby') {
+    if (activePlayers.length >= sgConfig.minPlayersToStart) sgStartCountdown();
+  } else if (sgMatch.phase === 'countdown') {
+    if (activePlayers.length < sgConfig.minPlayersToStart) {
+      sgMatch.phase = 'lobby';
+      sgMatch.countdownEndsAt = 0;
+      sgLog('system', 'Countdown cancelled: not enough players');
+    } else if (now >= sgMatch.countdownEndsAt) {
+      sgStartMatch();
+    }
+  } else if (sgMatch.phase === 'running') {
+    sgUpdateBorder(now);
+
+    // Move players and apply border damage.
+    for (const p of sgPlayers.values()) {
+      if (!p.alive || p.spectator) continue;
+      const mag = Math.hypot(p.mx || 0, p.my || 0);
+      if (mag > 1e-3) {
+        const nx = (p.mx || 0) / mag;
+        const ny = (p.my || 0) / mag;
+        p.x += nx * sgConfig.moveSpeed * dtSec;
+        p.y += ny * sgConfig.moveSpeed * dtSec;
+      }
+      sgClampPos(p);
+      const dd = dst(p.x, p.y, SG_CENTER.x, SG_CENTER.y);
+      if (dd > sgMatch.borderRadius) {
+        p.hp -= sgConfig.borderDamagePerSec * dtSec;
+        if (p.hp <= 0) sgKillPlayer(p, null, 'border');
+      }
+    }
+
+    const alive = sgAlivePlayers();
+    if (alive.length <= 1) {
+      sgEndMatch(alive[0] ? alive[0].id : null, 'last-alive');
+    } else if (now >= sgMatch.endsAt) {
+      const ranked = [...alive].sort((a, b) => (b.kills - a.kills) || (b.hp - a.hp));
+      sgEndMatch(ranked[0] ? ranked[0].id : null, 'time');
+    }
+  } else if (sgMatch.phase === 'ended') {
+    if (now - sgMatch.endedAt >= Math.max(5, sgConfig.autoResetSec) * 1000) {
+      sgResetRound(true);
+    }
+  }
+}
+
+function sgMatchPayload() {
+  const now = Date.now();
+  const graceRemaining = sgMatch.phase === 'running'
+    ? Math.max(0, Math.ceil((sgMatch.startedAt + sgConfig.graceSec * 1000 - now) / 1000))
+    : 0;
+  const countdownRemaining = sgMatch.phase === 'countdown'
+    ? Math.max(0, Math.ceil((sgMatch.countdownEndsAt - now) / 1000))
+    : 0;
+  const endRemaining = sgMatch.phase === 'running'
+    ? Math.max(0, Math.ceil((sgMatch.endsAt - now) / 1000))
+    : 0;
+  return {
+    phase: sgMatch.phase,
+    countdownRemaining,
+    graceRemaining,
+    endRemaining,
+    borderRadius: Math.round(sgMatch.borderRadius),
+    winnerId: sgMatch.winnerId,
+    endReason: sgMatch.endReason,
+    startedAt: sgMatch.startedAt,
+  };
+}
+
+function serSgPlayers() {
+  const out = [];
+  for (const p of sgPlayers.values()) {
+    out.push([
+      p.id,
+      p.name,
+      p.color,
+      Math.round(p.x),
+      Math.round(p.y),
+      Math.round(p.hp),
+      p.alive ? 1 : 0,
+      p.spectator ? 1 : 0,
+      p.kills || 0,
+      p.deaths || 0,
+      p.weaponTier || 0,
+      p.armorTier || 0,
+      p.face || 0,
+    ]);
+  }
+  return out;
+}
+
+function serSgChests() {
+  const now = Date.now();
+  return sgChests.map(c => [
+    c.id,
+    Math.round(c.x),
+    Math.round(c.y),
+    c.openedAt && now < c.nextRefillAt ? 1 : 0,
+  ]);
+}
+
+function mkSgLb() {
+  const lb = [];
+  for (const p of sgPlayers.values()) {
+    lb.push({
+      id: p.id,
+      n: p.name,
+      k: p.kills || 0,
+      hp: Math.round(p.hp || 0),
+      a: p.alive ? 1 : 0,
+      s: p.spectator ? 1 : 0,
+    });
+  }
+  lb.sort((a, b) => (b.k - a.k) || (b.hp - a.hp) || (a.s - b.s));
+  return lb.slice(0, 12);
+}
+
+function broadcastSurvival(data) {
+  for (const [cws, conn] of connections) {
+    if (conn.sgPlayerId || (conn.isAdmin && conn.adminGame === 'survival-games')) safeSend(cws, data);
+  }
+}
+
+function sendSurvivalAdminState(ws) {
+  const players = [];
+  for (const p of sgPlayers.values()) {
+    players.push({
+      id: p.id,
+      name: p.name,
+      alive: !!p.alive,
+      spectator: !!p.spectator,
+      hp: Math.round(p.hp || 0),
+      kills: p.kills || 0,
+      deaths: p.deaths || 0,
+      weaponTier: p.weaponTier || 0,
+      armorTier: p.armorTier || 0,
+      device: p.device || 'Unknown',
+    });
+  }
+  safeSend(ws, JSON.stringify({
+    t: 'sgas',
+    players,
+    cfg: sgConfig,
+    match: sgMatchPayload(),
+    chestCount: sgChests.length,
+    chestVer: sgChestVer,
+    gen: sgGen,
+    events: sgEvents.slice(-120),
+  }));
+}
+
+// ============================================================================
 // GAME TICK
 // ============================================================================
 function tick() {
@@ -586,7 +1038,9 @@ function safeSend(ws, data) {
 }
 
 function broadcast(data) {
-  for (const [cws] of connections) safeSend(cws, data);
+  for (const [cws, conn] of connections) {
+    if (conn.playerId || (conn.isAdmin && conn.adminGame !== 'survival-games')) safeSend(cws, data);
+  }
 }
 
 function sendAdminState(ws) {
@@ -622,8 +1076,10 @@ const server = http.createServer((req, res) => {
   if (req.url === '/' || req.url === '/status') {
     let h = 0, b = 0;
     for (const p of players.values()) { if (p.isBot) b++; else h++; }
+    const sgTotal = sgPlayers.size;
+    const sgAlive = sgAlivePlayers().length;
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ s: 'ok', h, b, paused: serverPaused }));
+    res.end(JSON.stringify({ s: 'ok', h, b, paused: serverPaused, sgTotal, sgAlive, sgPhase: sgMatch.phase }));
     return;
   }
   res.writeHead(404); res.end('Not Found');
@@ -636,7 +1092,7 @@ const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws, req) => {
   const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').toString().split(',')[0].trim();
-  const conn = { playerId: null, isAdmin: false, ip };
+  const conn = { playerId: null, sgPlayerId: null, isAdmin: false, adminGame: 'agar', ip };
   connections.set(ws, conn);
 
   ws.on('message', (raw) => {
@@ -649,6 +1105,12 @@ wss.on('connection', (ws, req) => {
       const p = players.get(conn.playerId);
       if (p) logActivity('leave', p.name, p.device || '', conn.ip);
       players.delete(conn.playerId);
+    }
+    if (conn.sgPlayerId) {
+      const sp = sgPlayers.get(conn.sgPlayerId);
+      if (sp) sgLog('leave', `${sp.name} left`);
+      sgPlayers.delete(conn.sgPlayerId);
+      conn.sgPlayerId = null;
     }
     connections.delete(ws);
   });
@@ -663,11 +1125,162 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => clearInterval(ping));
 });
 
+function sgJoin(ws, conn, msg) {
+  if (serverPaused) { safeSend(ws, JSON.stringify({ t: 'sgk', reason: 'Server is paused by admin.' })); return; }
+  if (conn.playerId) {
+    const old = players.get(conn.playerId);
+    if (old) logActivity('leave', old.name, old.device || '', conn.ip);
+    players.delete(conn.playerId);
+    conn.playerId = null;
+  }
+  const name = String((msg.name || 'Survivor')).trim().slice(0, 20) || 'Survivor';
+  for (const [id, p] of sgPlayers) {
+    if (p.name.toLowerCase() !== name.toLowerCase()) continue;
+    for (const [ows, oc] of connections) {
+      if (oc.sgPlayerId === id && ows !== ws && ows.readyState === 1) {
+        safeSend(ows, JSON.stringify({ t: 'sgk', reason: 'Another session joined with your name' }));
+      }
+    }
+    sgPlayers.delete(id);
+  }
+
+  const id = `sg-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const p = {
+    id,
+    name,
+    color: pick(CLR),
+    x: SG_CENTER.x,
+    y: SG_CENTER.y,
+    mx: 0,
+    my: 0,
+    face: 0,
+    hp: SG_MAX_HP,
+    alive: true,
+    spectator: false,
+    kills: 0,
+    deaths: 0,
+    weaponTier: 0,
+    armorTier: 0,
+    invulnUntil: 0,
+    lastAttack: 0,
+    lastPing: Date.now(),
+    joinTime: Date.now(),
+    device: parseDevice(msg.ua || 'Unknown'),
+  };
+
+  if (sgMatch.phase === 'running' && sgConfig.lateJoinAsSpectator) sgSetSpectator(p);
+  else sgResetPlayerForRound(p);
+
+  sgPlayers.set(id, p);
+  conn.sgPlayerId = id;
+  conn.playerId = null;
+  sgLog('join', `${name} joined Survival Games`);
+
+  safeSend(ws, JSON.stringify({
+    t: 'sgw',
+    id,
+    w: SG_W,
+    h: SG_H,
+    cfg: sgConfig,
+    match: sgMatchPayload(),
+    p: serSgPlayers(),
+    c: serSgChests(),
+    lb: mkSgLb(),
+    gen: sgGen,
+    ev: sgEvents.slice(-20),
+  }));
+}
+
+function sgInput(conn, msg) {
+  if (!conn.sgPlayerId) return;
+  const p = sgPlayers.get(conn.sgPlayerId);
+  if (!p) return;
+  if (typeof msg.mx === 'number' && Number.isFinite(msg.mx)) p.mx = clp(msg.mx, -1, 1);
+  if (typeof msg.my === 'number' && Number.isFinite(msg.my)) p.my = clp(msg.my, -1, 1);
+  if (typeof msg.face === 'number' && Number.isFinite(msg.face)) p.face = msg.face;
+  p.lastPing = Date.now();
+}
+
+function sgLeave(conn) {
+  if (!conn.sgPlayerId) return;
+  const p = sgPlayers.get(conn.sgPlayerId);
+  if (p) sgLog('leave', `${p.name} left Survival Games`);
+  sgPlayers.delete(conn.sgPlayerId);
+  conn.sgPlayerId = null;
+}
+
+function sgUpdateConfig(msg) {
+  const numeric = [
+    'minPlayersToStart', 'countdownSec', 'graceSec', 'matchDurationSec',
+    'moveSpeed', 'attackCooldownMs', 'attackRange', 'baseDamage',
+    'borderStartRadius', 'borderEndRadius', 'borderShrinkDelaySec', 'borderShrinkDurationSec',
+    'borderDamagePerSec', 'chestOpenRange', 'chestRefillSec', 'weaponMaxTier', 'armorMaxTier', 'autoResetSec',
+  ];
+  for (const k of numeric) {
+    if (msg[k] === undefined) continue;
+    const v = Number(msg[k]);
+    if (!Number.isFinite(v)) continue;
+    sgConfig[k] = v;
+  }
+  if (msg.lateJoinAsSpectator !== undefined) sgConfig.lateJoinAsSpectator = !!msg.lateJoinAsSpectator;
+
+  sgConfig.minPlayersToStart = clp(Math.round(sgConfig.minPlayersToStart), 1, 50);
+  sgConfig.countdownSec = clp(Math.round(sgConfig.countdownSec), 3, 60);
+  sgConfig.graceSec = clp(Math.round(sgConfig.graceSec), 0, 120);
+  sgConfig.matchDurationSec = clp(Math.round(sgConfig.matchDurationSec), 30, 1800);
+  sgConfig.moveSpeed = clp(sgConfig.moveSpeed, 80, 1200);
+  sgConfig.attackCooldownMs = clp(Math.round(sgConfig.attackCooldownMs), 150, 5000);
+  sgConfig.attackRange = clp(sgConfig.attackRange, 30, 400);
+  sgConfig.baseDamage = clp(sgConfig.baseDamage, 1, 120);
+  sgConfig.borderStartRadius = clp(sgConfig.borderStartRadius, 300, 3000);
+  sgConfig.borderEndRadius = clp(sgConfig.borderEndRadius, 100, sgConfig.borderStartRadius);
+  sgConfig.borderShrinkDelaySec = clp(Math.round(sgConfig.borderShrinkDelaySec), 0, 900);
+  sgConfig.borderShrinkDurationSec = clp(Math.round(sgConfig.borderShrinkDurationSec), 1, 1800);
+  sgConfig.borderDamagePerSec = clp(sgConfig.borderDamagePerSec, 1, 100);
+  sgConfig.chestOpenRange = clp(sgConfig.chestOpenRange, 20, 300);
+  sgConfig.chestRefillSec = clp(Math.round(sgConfig.chestRefillSec), 5, 600);
+  sgConfig.weaponMaxTier = clp(Math.round(sgConfig.weaponMaxTier), 0, 10);
+  sgConfig.armorMaxTier = clp(Math.round(sgConfig.armorMaxTier), 0, 10);
+  sgConfig.autoResetSec = clp(Math.round(sgConfig.autoResetSec), 5, 180);
+
+  if (sgMatch.phase === 'lobby' || sgMatch.phase === 'countdown') {
+    sgMatch.borderRadius = sgConfig.borderStartRadius;
+  }
+}
+
 function handleMessage(ws, conn, msg) {
   switch (msg.t) {
+    // ---- Survival Games Join ----
+    case 'sgj': {
+      sgJoin(ws, conn, msg);
+      break;
+    }
+    // ---- Survival Games Input ----
+    case 'sgi': {
+      sgInput(conn, msg);
+      break;
+    }
+    // ---- Survival Games Attack ----
+    case 'sgatk': {
+      if (!conn.sgPlayerId) break;
+      sgTryAttack(sgPlayers.get(conn.sgPlayerId));
+      break;
+    }
+    // ---- Survival Games Open Chest ----
+    case 'sgopen': {
+      if (!conn.sgPlayerId) break;
+      sgTryOpenChest(sgPlayers.get(conn.sgPlayerId));
+      break;
+    }
+    // ---- Survival Games Leave ----
+    case 'sgl': {
+      sgLeave(conn);
+      break;
+    }
     // ---- Join ----
     case 'j': {
       if (serverPaused) { ws.send(JSON.stringify({ t: 'k', reason: 'Server is currently paused. Try again later.' })); return; }
+      if (conn.sgPlayerId) sgLeave(conn);
       const name = (msg.name || 'Player').trim().slice(0, 20);
       const kickReason = kicked.get(name.toLowerCase());
       if (kickReason) { ws.send(JSON.stringify({ t: 'k', reason: kickReason })); return; }
@@ -881,11 +1494,48 @@ function handleMessage(ws, conn, msg) {
     case 'aa': {
       if (msg.pw === ADMIN_PW) {
         conn.isAdmin = true;
-        ws.send(JSON.stringify({ t: 'aa', ok: 1 }));
-        sendAdminState(ws);
+        const requestedGame = String(msg.game || 'agar');
+        conn.adminGame = (requestedGame === 'survival-games' || requestedGame === 'sg') ? 'survival-games' : 'agar';
+        ws.send(JSON.stringify({ t: 'aa', ok: 1, game: conn.adminGame }));
+        if (conn.adminGame === 'survival-games') sendSurvivalAdminState(ws);
+        else sendAdminState(ws);
       } else {
         ws.send(JSON.stringify({ t: 'aa', ok: 0 }));
       }
+      break;
+    }
+    // ---- Survival Games Admin Config ----
+    case 'sgcfg': {
+      if (!conn.isAdmin || conn.adminGame !== 'survival-games') return;
+      sgUpdateConfig(msg);
+      broadcastSurvival(JSON.stringify({ t: 'sgcfg', cfg: sgConfig }));
+      safeSend(ws, JSON.stringify({ t: 'am', ok: 1, action: 'survival_admin_config' }));
+      break;
+    }
+    // ---- Survival Games Admin Start ----
+    case 'sgstart': {
+      if (!conn.isAdmin || conn.adminGame !== 'survival-games') return;
+      if (sgMatch.phase === 'running') {
+        safeSend(ws, JSON.stringify({ t: 'am', ok: 0, action: 'survival_admin_start' }));
+        break;
+      }
+      sgStartMatch();
+      safeSend(ws, JSON.stringify({ t: 'am', ok: 1, action: 'survival_admin_start' }));
+      break;
+    }
+    // ---- Survival Games Admin Stop ----
+    case 'sgstop': {
+      if (!conn.isAdmin || conn.adminGame !== 'survival-games') return;
+      sgEndMatch(null, 'stopped-by-admin');
+      safeSend(ws, JSON.stringify({ t: 'am', ok: 1, action: 'survival_admin_stop' }));
+      break;
+    }
+    // ---- Survival Games Admin Reset ----
+    case 'sgreset': {
+      if (!conn.isAdmin || conn.adminGame !== 'survival-games') return;
+      const hard = !!msg.hard;
+      sgResetRound(!hard);
+      safeSend(ws, JSON.stringify({ t: 'am', ok: 1, action: 'survival_admin_reset' }));
       break;
     }
     // ---- Admin Pause / Resume ----
@@ -893,14 +1543,17 @@ function handleMessage(ws, conn, msg) {
       if (!conn.isAdmin) return;
       serverPaused = !!msg.paused;
       if (serverPaused) {
-        // Kick all non-admin players and bots
+        // Kick all non-admin players and bots in all game modes.
         for (const [ows, oc] of connections) {
-          if (oc.playerId && !oc.isAdmin && ows.readyState === 1) {
-            ows.send(JSON.stringify({ t: 'k', reason: 'Server has been paused by admin.' }));
+          if (!oc.isAdmin && ows.readyState === 1) {
+            if (oc.playerId) ows.send(JSON.stringify({ t: 'k', reason: 'Server has been paused by admin.' }));
+            if (oc.sgPlayerId) ows.send(JSON.stringify({ t: 'sgk', reason: 'Server has been paused by admin.' }));
           }
         }
-        // Remove all players (bots + humans)
+        // Remove all players (bots + humans) in both modes.
         players.clear();
+        sgPlayers.clear();
+        sgResetRound(false);
       }
       ws.send(JSON.stringify({ t: 'am', ok: 1, action: 'admin_pause' }));
       break;
@@ -1163,6 +1816,7 @@ setInterval(() => {
   if (serverPaused) return; // skip everything when paused
   const t0 = performance.now();
   tick();
+  sgTick();
   const tickMs = performance.now() - t0;
   dbg.tickMs = tickMs;
   dbg.tickCount++;
@@ -1174,6 +1828,7 @@ setInterval(() => {
   tickCount++;
   if (tickCount % Math.round(TICK_RATE / BROADCAST_RATE) === 0) {
     broadcastState();
+    broadcastSurvivalState();
     broadcastAdminState();
   }
 }, Math.round(1000 / TICK_RATE));
@@ -1207,10 +1862,31 @@ function broadcastState() {
   }
 }
 
+function broadcastSurvivalState() {
+  const state = {
+    t: 'sgu',
+    p: serSgPlayers(),
+    lb: mkSgLb(),
+    m: sgMatchPayload(),
+    cv: sgChestVer,
+    c: serSgChests(),
+    cfg: sgConfig,
+    gen: sgGen,
+  };
+  if (sgEvents.length > sgLastEventBroadcastLen) {
+    state.ev = sgEvents.slice(sgLastEventBroadcastLen).map(e => ({ ts: e.ts, type: e.type, msg: e.msg }));
+    sgLastEventBroadcastLen = sgEvents.length;
+  }
+  broadcastSurvival(JSON.stringify(state));
+}
+
 function broadcastAdminState() {
   for (const [ws, conn] of connections) {
     if (conn.isAdmin && ws.readyState === 1) {
-      try { sendAdminState(ws); } catch (_) { /* ignore */ }
+      try {
+        if (conn.adminGame === 'survival-games') sendSurvivalAdminState(ws);
+        else sendAdminState(ws);
+      } catch (_) { /* ignore */ }
     }
   }
 }
