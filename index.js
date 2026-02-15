@@ -13,6 +13,11 @@ const DEFAULT_W = 4000, DEFAULT_H = 4000;
 let W = DEFAULT_W, H = DEFAULT_H;
 const FOOD_N = 300;
 const SM = 10, SPLIT_MIN = 35, MAX_CELLS = 16, EAT_R = 1.25, BSPD = 5, MAX_MASS = 100000;
+const PHASE_OUT_DEFAULT = 2.5; // seconds of invulnerability after join/respawn
+const SPLIT_COOLDOWN_MS = 140;
+const BG_MUSIC_MUTE = -1;
+const BG_MUSIC_RANDOM = -2;
+const MUSIC_TRACK_COUNT = 20;
 const CLR = ['#FF6B6B','#4ECDC4','#45B7D1','#96CEB4','#FFEAA7','#DDA0DD','#98D8C8','#F7DC6F','#BB8FCE','#85C1E9','#F8B500','#FF69B4'];
 const FCLR = ['#FF6B6B','#4ECDC4','#45B7D1','#96CEB4','#FFEAA7','#DDA0DD','#98D8C8','#F7DC6F'];
 
@@ -36,8 +41,10 @@ const gameConfig = {
   laserCooldown: 3,    // seconds between laser shots
   laserDamage: 15,     // mass removed per laser hit
   laserRange: 400,     // max laser range in world units
-  bgMusic: 0,          // background music track index (-1=none, 0-19=track)
+  bgMusic: BG_MUSIC_RANDOM, // -2=random per join, -1=none, 0-19=fixed track
   // ---- Azoz Mode Config ----
+  phaseOutTime: PHASE_OUT_DEFAULT, // seconds of invulnerability after join
+  endGameMessage: 'You were eaten!', // default end game message (configurable)
   azozMapRatio: 1,           // x1: map adapt ratio (multiplier on total mass → world size)
   azozMaxFoodMass: 5000,     // x2: max mass reachable from regular food
   azozMushroomThreshold: 5000, // x3: min mass to consume red mushroom
@@ -137,6 +144,19 @@ function com(cells) {
   return { x: cx / t, y: cy / t };
 }
 function tmass(cells) { let s = 0; for (const c of cells) s += c.m; return s; }
+function sanitizeEndGameMessage(v) {
+  if (typeof v !== 'string') return 'You were eaten!';
+  const trimmed = v.trim().slice(0, 80);
+  return trimmed || 'You were eaten!';
+}
+function resolveIntroTrack() {
+  const track = Number(gameConfig.bgMusic);
+  if (!Number.isFinite(track)) return BG_MUSIC_MUTE;
+  if (track === BG_MUSIC_MUTE) return BG_MUSIC_MUTE;
+  if (track === BG_MUSIC_RANDOM) return Math.floor(Math.random() * MUSIC_TRACK_COUNT);
+  if (track >= 0 && track < MUSIC_TRACK_COUNT) return Math.floor(track);
+  return BG_MUSIC_MUTE;
+}
 
 // ---- Game State ----
 const players = new Map(); // id -> PlayerData
@@ -413,7 +433,7 @@ function tick() {
   }
   if (virusChanged) virusVer++;
 
-  // ---- PvP — at least one side must be a bot (disabled in laser mode) ----
+  // ---- PvP (server-authoritative, disabled in laser mode) ----
   const all = [];
   for (const p of players.values()) for (const c of p.cells) all.push({ cell: c, p });
   const eaten = new Set();
@@ -424,10 +444,10 @@ function tick() {
       if (eaten.has(all[j].cell.id)) continue;
       const { cell: c1, p: p1 } = all[i], { cell: c2, p: p2 } = all[j];
       if (p1.id === p2.id) continue;
-      if (!p1.isBot && !p2.isBot) continue;
+      if ((p1.phaseOutUntil && now < p1.phaseOutUntil) || (p2.phaseOutUntil && now < p2.phaseOutUntil)) continue;
       const d = dst(c1.x, c1.y, c2.x, c2.y);
-      if (c1.m > c2.m * EAT_R && d < rad(c1.m) - rad(c2.m) * 0.6) { c1.m += c2.m; p2.cells = p2.cells.filter(c => c.id !== c2.id); eaten.add(c2.id); }
-      else if (c2.m > c1.m * EAT_R && d < rad(c2.m) - rad(c1.m) * 0.6) { c2.m += c1.m; p1.cells = p1.cells.filter(c => c.id !== c1.id); eaten.add(c1.id); break; }
+      if (c1.m > c2.m * EAT_R && d < rad(c1.m) - rad(c2.m) * 0.45) { c1.m += c2.m; p2.cells = p2.cells.filter(c => c.id !== c2.id); eaten.add(c2.id); }
+      else if (c2.m > c1.m * EAT_R && d < rad(c2.m) - rad(c1.m) * 0.45) { c2.m += c1.m; p1.cells = p1.cells.filter(c => c.id !== c1.id); eaten.add(c1.id); break; }
     }
   }
 
@@ -447,7 +467,12 @@ function tick() {
         p.deathTime = Date.now();
         for (const [ws, conn] of connections) {
           if (conn.playerId === p.id && ws.readyState === 1) {
-            safeSend(ws, JSON.stringify({ t: 'death', peak: p.peakMass || SM, timeAlive: Math.floor((Date.now() - (p.joinTime || Date.now())) / 1000) }));
+            safeSend(ws, JSON.stringify({
+              t: 'death',
+              peak: p.peakMass || SM,
+              timeAlive: Math.floor((Date.now() - (p.joinTime || Date.now())) / 1000),
+              msg: gameConfig.endGameMessage,
+            }));
           }
         }
       }
@@ -465,8 +490,9 @@ function doSplit(p) {
   if (p.cells.length >= MAX_CELLS) return;
   const news = [];
   const c = com(p.cells), ba = Math.atan2(p.my - c.y, p.mx - c.x);
+  let canAdd = MAX_CELLS - p.cells.length;
   for (const cell of p.cells) {
-    if (cell.m >= SPLIT_MIN && p.cells.length + news.length < MAX_CELLS) {
+    if (cell.m >= SPLIT_MIN && canAdd > 0) {
       const half = Math.floor(cell.m / 2); cell.m = half;
       const a = ba + (Math.random() - 0.5) * 0.5, r = rad(half);
       const spawnDist = r + 10;
@@ -476,6 +502,7 @@ function doSplit(p) {
         vx: Math.cos(a) * gameConfig.splitSpeed, vy: Math.sin(a) * gameConfig.splitSpeed,
         splitTime: Date.now(),
       });
+      canAdd--;
     }
   }
   p.cells.push(...news);
@@ -628,12 +655,16 @@ function handleMessage(ws, conn, msg) {
       const emoji = (msg.emoji && typeof msg.emoji === 'string' && msg.emoji.length <= 4) ? msg.emoji : '';
       const pos = rp();
       const cell = { id: uid(), x: pos.x, y: pos.y, m: SM, c: color };
-      const p = { id, name, color, emoji, isBot: false, feedBonus: 0, cells: [cell],
+      const p = {
+        id, name, color, emoji, isBot: false, feedBonus: 0, cells: [cell],
         mx: pos.x, my: pos.y, lastPing: Date.now(), device,
-        dead: false, deathTime: 0, joinTime: Date.now(), peakMass: SM, lastLaser: 0 };
+        dead: false, deathTime: 0, joinTime: Date.now(), peakMass: SM, lastLaser: 0, lastSplitAt: 0,
+        phaseOutUntil: Date.now() + ((gameConfig.phaseOutTime || PHASE_OUT_DEFAULT) * 1000),
+      };
       players.set(id, p);
       conn.playerId = id;
       logActivity('join', name, device, conn.ip);
+      const joinTrack = resolveIntroTrack();
       ws.send(JSON.stringify({
         t: 'w', id, mc: cell, w: W, h: H,
         f: serFood(), fv: foodVer, gen,
@@ -643,11 +674,11 @@ function handleMessage(ws, conn, msg) {
         v: viruses.map(v => [v.id, Math.round(v.x), Math.round(v.y), v.m]),
         mush: serMushrooms(), mushVer: mushroomVer,
         ev: activityLog.slice(-10).map(e => ({ ts: e.ts, type: e.type, name: e.name })),
-        bgTrack: gameConfig.bgMusic,
+        bgTrack: joinTrack,
       }));
-      // Broadcast intro music to ALL players AFTER welcome (everyone hears it when someone joins)
-      if (gameConfig.bgMusic >= 0) {
-        broadcast(JSON.stringify({ t: 'playMusic', track: gameConfig.bgMusic }));
+      // Broadcast join music so everyone hears the same track.
+      if (joinTrack >= 0) {
+        broadcast(JSON.stringify({ t: 'playMusic', track: joinTrack }));
       }
       break;
     }
@@ -657,15 +688,12 @@ function handleMessage(ws, conn, msg) {
       if (!p || p.isBot) return;
       if (msg.x !== undefined) p.mx = msg.x;
       if (msg.y !== undefined) p.my = msg.y;
-      if (msg.cells) {
+      if (Array.isArray(msg.cells)) {
         for (const cd of msg.cells) {
           const cell = p.cells.find(c => c.id === cd[0]);
-          if (cell) {
-            cell.x = cd[1]; cell.y = cd[2];
-            // Accept mass increases only if small (food eating ≈ +1–20 per update).
-            // Large jumps indicate stale data that would undo virus splits.
-            if (typeof cd[3] === 'number' && cd[3] >= cell.m && cd[3] <= cell.m + 60) cell.m = Math.min(cd[3], MAX_MASS);
-          }
+          if (!cell) continue;
+          if (typeof cd[1] === 'number') cell.x = cd[1];
+          if (typeof cd[2] === 'number') cell.y = cd[2];
         }
         // Track peak mass
         const tm = tmass(p.cells);
@@ -677,7 +705,14 @@ function handleMessage(ws, conn, msg) {
     // ---- Split ----
     case 's': {
       const p = players.get(conn.playerId);
-      if (p) { p.lastPing = Date.now(); doSplit(p); }
+      if (p && !p.dead && p.cells.length > 0) {
+        p.lastPing = Date.now();
+        const now = Date.now();
+        if (now - (p.lastSplitAt || 0) >= SPLIT_COOLDOWN_MS) {
+          p.lastSplitAt = now;
+          doSplit(p);
+        }
+      }
       break;
     }
     // ---- Eject Mass ----
@@ -707,6 +742,8 @@ function handleMessage(ws, conn, msg) {
         p.joinTime = Date.now();
         p.peakMass = SM;
         p.lastLaser = 0;
+        p.lastSplitAt = 0;
+        p.phaseOutUntil = Date.now() + ((gameConfig.phaseOutTime || PHASE_OUT_DEFAULT) * 1000);
       }
       break;
     }
@@ -807,6 +844,7 @@ function handleMessage(ws, conn, msg) {
         id: botId, name: botName, color, isBot: true, feedBonus: 0,
         cells: [{ id: uid(), x: pos.x, y: pos.y, m: botMass, c: color }],
         mx: pos.x, my: pos.y, lastPing: Date.now(), device: 'Bot',
+        dead: false, deathTime: 0, joinTime: Date.now(), peakMass: botMass, lastLaser: 0, lastSplitAt: 0, phaseOutUntil: 0,
         bot: { tx: pos.x, ty: pos.y, rt: Date.now() + 1000, scd: Date.now() + 5000 },
       });
       ws.send(JSON.stringify({ t: 'am', ok: 1, action: 'admin_add_bot', botId }));
@@ -861,10 +899,26 @@ function handleMessage(ws, conn, msg) {
         'virusCount','virusMass','ejectMass','ejectSpeed','ejectLoss',
         'gameMode','laserCooldown','laserDamage','laserRange','bgMusic',
         'azozMapRatio','azozMaxFoodMass','azozMushroomThreshold','azozMushroomFlash',
-        'azozMushroomLifetime','azozMushroomName','redMushroom'];
+        'azozMushroomLifetime','azozMushroomName','redMushroom',
+        'phaseOutTime','endGameMessage'];
       const oldVC = gameConfig.virusCount, oldVM = gameConfig.virusMass;
       for (const k of allowed) {
-        if (msg[k] !== undefined) gameConfig[k] = msg[k];
+        if (msg[k] === undefined) continue;
+        if (k === 'phaseOutTime') {
+          const v = Number(msg[k]);
+          if (Number.isFinite(v)) gameConfig.phaseOutTime = clp(v, 0, 20);
+          continue;
+        }
+        if (k === 'endGameMessage') {
+          gameConfig.endGameMessage = sanitizeEndGameMessage(msg[k]);
+          continue;
+        }
+        if (k === 'bgMusic') {
+          const v = Math.floor(Number(msg[k]));
+          if (Number.isFinite(v)) gameConfig.bgMusic = clp(v, BG_MUSIC_RANDOM, MUSIC_TRACK_COUNT - 1);
+          continue;
+        }
+        gameConfig[k] = msg[k];
       }
       // Re-init viruses only if count or mass actually changed
       if (gameConfig.virusCount !== oldVC || gameConfig.virusMass !== oldVM) {
@@ -948,29 +1002,7 @@ function handleMessage(ws, conn, msg) {
     }
     // ---- Client Eat Report ----
     case 'e': {
-      if (gameConfig.gameMode === 'laser') return; // no eating in laser mode
-      if (!conn.playerId) return;
-      const eater = players.get(conn.playerId);
-      if (!eater) return;
-      // msg.cid = eaten cell id, msg.eid = eater cell id
-      if (!msg.cid || !msg.eid) return;
-      // Find eater cell
-      const eaterCell = eater.cells.find(c => c.id === msg.eid);
-      if (!eaterCell) return;
-      // Find victim cell across all players
-      for (const [vid, vp] of players) {
-        if (vid === conn.playerId) continue;
-        const idx = vp.cells.findIndex(c => c.id === msg.cid);
-        if (idx !== -1) {
-          const eaten = vp.cells[idx];
-          // Validate: eater must be bigger
-          if (eaterCell.m > eaten.m * 0.8) {
-            eaterCell.m = Math.min(eaterCell.m + eaten.m, MAX_MASS);
-            vp.cells.splice(idx, 1);
-          }
-          break;
-        }
-      }
+      // Deprecated: server resolves PvP in tick() for precision.
       break;
     }
     // ---- Client Mushroom Eat Report ----
