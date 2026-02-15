@@ -313,6 +313,10 @@ const sgConfig = {
   mapSeed: 1337,
   mapPropDensity: 1,
   mapObstacleCount: 160,
+  botFillEnabled: true,
+  botFillTargetPlayers: 6,
+  botFillMaxBots: 8,
+  botDifficulty: 1,
 };
 
 const sgPlayers = new Map(); // id -> SGPlayer
@@ -601,6 +605,177 @@ function sgGenerateMap(seedInput) {
   sgMap = { seed, props, pois };
   sgMapVer++;
   sgRebuildMapGrid();
+}
+
+const SG_BOT_NAMES = [
+  'Revenant', 'Spartan', 'Ninja', 'Falcon', 'Rogue', 'Titan', 'Specter', 'Nova', 'Brawler', 'Ranger',
+  'Shifter', 'Viper', 'Golem', 'Drifter', 'Hunter', 'Prowler', 'Knight', 'Warden', 'Cyclone', 'Raptor',
+];
+
+function sgHumanCount(includeSpectators = false) {
+  let n = 0;
+  for (const p of sgPlayers.values()) {
+    if (p.isBot) continue;
+    if (!includeSpectators && p.spectator) continue;
+    n++;
+  }
+  return n;
+}
+
+function sgBotCount(includeSpectators = false) {
+  let n = 0;
+  for (const p of sgPlayers.values()) {
+    if (!p.isBot) continue;
+    if (!includeSpectators && p.spectator) continue;
+    n++;
+  }
+  return n;
+}
+
+function sgMkUniqueBotName() {
+  for (let attempt = 0; attempt < 120; attempt++) {
+    const base = SG_BOT_NAMES[attempt % SG_BOT_NAMES.length];
+    const suffix = 10 + ((attempt * 17 + Date.now()) % 89);
+    const name = `${base}-${suffix}`;
+    let exists = false;
+    for (const p of sgPlayers.values()) {
+      if (p.name.toLowerCase() === name.toLowerCase()) { exists = true; break; }
+    }
+    if (!exists) return name;
+  }
+  return `Bot-${Math.floor(Math.random() * 9999)}`;
+}
+
+function sgSpawnBot() {
+  const id = `sgb-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const p = {
+    id,
+    name: sgMkUniqueBotName(),
+    color: pick(CLR),
+    x: SG_CENTER.x,
+    y: SG_CENTER.y,
+    mx: 0,
+    my: 0,
+    face: 0,
+    hp: SG_MAX_HP,
+    alive: true,
+    spectator: false,
+    kills: 0,
+    deaths: 0,
+    weaponTier: 0,
+    armorTier: 0,
+    soups: 1,
+    compassCharges: 1,
+    sneakyCharges: 1,
+    weightlessCharges: 1,
+    invulnUntil: 0,
+    invisUntil: 0,
+    speedUntil: 0,
+    hitGlowUntil: 0,
+    nextCompassAt: 0,
+    nextSneakyAt: 0,
+    nextWeightlessAt: 0,
+    lastAttack: 0,
+    lastPing: Date.now(),
+    joinTime: Date.now(),
+    isBot: true,
+    bot: {
+      nextThinkAt: 0,
+      mx: 0,
+      my: 0,
+      wanderA: Math.random() * Math.PI * 2,
+    },
+    device: 'Bot',
+  };
+  sgResetPlayerForRound(p);
+  sgPlayers.set(id, p);
+  sgLog('join', `${p.name} joined as bot`);
+  return p;
+}
+
+function sgRemoveOneBot(reason = 'bot-adjust') {
+  for (const p of sgPlayers.values()) {
+    if (!p.isBot) continue;
+    sgPlayers.delete(p.id);
+    sgLog('leave', `${p.name} removed (${reason})`);
+    return true;
+  }
+  return false;
+}
+
+function sgEnsureBotFill() {
+  if (!sgConfig.botFillEnabled) {
+    while (sgRemoveOneBot('bot-fill-disabled')) { /* remove all bots */ }
+    return;
+  }
+  if (sgMatch.phase !== 'lobby' && sgMatch.phase !== 'countdown') return;
+
+  const humans = sgHumanCount(false);
+  const bots = sgBotCount(false);
+  const targetPlayers = clp(Math.round(Number(sgConfig.botFillTargetPlayers) || 6), 1, 30);
+  const maxBots = clp(Math.round(Number(sgConfig.botFillMaxBots) || 8), 0, 20);
+  const desiredBots = clp(targetPlayers - humans, 0, maxBots);
+  if (bots < desiredBots) {
+    for (let i = bots; i < desiredBots; i++) sgSpawnBot();
+  } else if (bots > desiredBots) {
+    for (let i = desiredBots; i < bots; i++) sgRemoveOneBot('bot-fill-balance');
+  }
+}
+
+function sgUpdateBotAI(now) {
+  const diff = clp(Number(sgConfig.botDifficulty) || 1, 0.2, 3);
+  const thinkEvery = clp(360 / diff, 110, 800);
+  for (const p of sgPlayers.values()) {
+    if (!p.isBot || !p.alive || p.spectator) continue;
+    p.lastPing = now;
+    if (!p.bot) p.bot = { nextThinkAt: 0, mx: 0, my: 0, wanderA: Math.random() * Math.PI * 2 };
+    if (now >= (p.bot.nextThinkAt || 0)) {
+      let mx = 0;
+      let my = 0;
+      const nearest = sgFindNearestEnemy(p);
+      if (nearest) {
+        const tx = nearest.target.x - p.x;
+        const ty = nearest.target.y - p.y;
+        const dist = Math.max(1, Math.hypot(tx, ty));
+        const close = dist < Math.max(110, Number(sgConfig.attackRange) * 0.95);
+        const flee = p.hp < 34 || (nearest.target.weaponTier > p.weaponTier + 1 && p.hp < 70);
+        if (flee) {
+          mx = -tx / dist;
+          my = -ty / dist;
+        } else if (close) {
+          const perp = Math.random() < 0.5 ? -1 : 1;
+          mx = (ty / dist) * perp * 0.64 + (tx / dist) * 0.28;
+          my = (-tx / dist) * perp * 0.64 + (ty / dist) * 0.28;
+        } else {
+          mx = tx / dist;
+          my = ty / dist;
+        }
+      } else {
+        p.bot.wanderA += (Math.random() * 0.9 - 0.45);
+        mx = Math.cos(p.bot.wanderA);
+        my = Math.sin(p.bot.wanderA);
+      }
+      const mag = Math.max(1e-4, Math.hypot(mx, my));
+      p.bot.mx = mx / mag;
+      p.bot.my = my / mag;
+      p.bot.nextThinkAt = now + thinkEvery + Math.random() * 190;
+    }
+    p.mx = p.bot.mx || 0;
+    p.my = p.bot.my || 0;
+    if (Math.hypot(p.mx, p.my) > 1e-3) p.face = Math.atan2(p.my, p.mx);
+
+    if (sgMatch.phase !== 'running') continue;
+    if (p.hp < 58 && (p.soups || 0) > 0) sgTrySoup(p);
+    if ((p.sneakyCharges || 0) > 0 && Math.random() < 0.0018 * diff) sgTryAbility(p, 'sneaky');
+    if ((p.weightlessCharges || 0) > 0 && Math.random() < 0.0018 * diff) sgTryAbility(p, 'weightless');
+
+    const nearest = sgFindNearestEnemy(p);
+    if (nearest && nearest.dist < Math.max(90, Number(sgConfig.attackRange) * 1.03)) {
+      sgTryAttack(p);
+    } else if (Math.random() < 0.011 * diff) {
+      sgTryOpenChest(p);
+    }
+  }
 }
 
 function sgLog(type, msg) {
@@ -1011,6 +1186,7 @@ function sgTick() {
 
   // Remove stale/idle players.
   for (const [id, p] of sgPlayers) {
+    if (p.isBot) continue;
     if (now - (p.lastPing || now) > SG_IDLE_TIMEOUT_MS) {
       sgPlayers.delete(id);
       sgLog('leave', `${p.name} timed out`);
@@ -1025,6 +1201,9 @@ function sgTick() {
       sgChestVer++;
     }
   }
+
+  sgEnsureBotFill();
+  sgUpdateBotAI(now);
 
   const activePlayers = sgActivePlayers();
   if (sgMatch.phase === 'lobby') {
@@ -1149,6 +1328,7 @@ function serSgPlayers() {
       p.nextCompassAt || 0,
       p.nextSneakyAt || 0,
       p.nextWeightlessAt || 0,
+      p.isBot ? 1 : 0,
     ]);
   }
   return out;
@@ -1218,6 +1398,7 @@ function sendSurvivalAdminState(ws) {
       nextCompassAt: p.nextCompassAt || 0,
       nextSneakyAt: p.nextSneakyAt || 0,
       nextWeightlessAt: p.nextWeightlessAt || 0,
+      isBot: !!p.isBot,
       device: p.device || 'Unknown',
     });
   }
@@ -1755,6 +1936,7 @@ function sgUpdateConfig(msg) {
     'speedBoostMultiplier', 'speedBoostDurationSec', 'speedBoostCooldownSec',
     'feastTimeSec', 'feastAnnounceLeadSec', 'feastChestCount',
     'mapSeed', 'mapPropDensity', 'mapObstacleCount',
+    'botFillTargetPlayers', 'botFillMaxBots', 'botDifficulty',
     'chestTier2Chance', 'chestTier3Chance',
     'borderStartRadius', 'borderEndRadius', 'borderShrinkDelaySec', 'borderShrinkDurationSec',
     'borderDamagePerSec', 'chestOpenRange', 'chestRefillSec', 'weaponMaxTier', 'armorMaxTier', 'autoResetSec',
@@ -1767,6 +1949,7 @@ function sgUpdateConfig(msg) {
   }
   if (msg.lateJoinAsSpectator !== undefined) sgConfig.lateJoinAsSpectator = !!msg.lateJoinAsSpectator;
   if (msg.feastEnabled !== undefined) sgConfig.feastEnabled = !!msg.feastEnabled;
+  if (msg.botFillEnabled !== undefined) sgConfig.botFillEnabled = !!msg.botFillEnabled;
 
   sgConfig.minPlayersToStart = clp(Math.round(sgConfig.minPlayersToStart), 1, 50);
   sgConfig.countdownSec = clp(Math.round(sgConfig.countdownSec), 3, 60);
@@ -1792,6 +1975,9 @@ function sgUpdateConfig(msg) {
   sgConfig.mapSeed = Math.max(1, Math.floor(Math.abs(sgConfig.mapSeed || 1337)));
   sgConfig.mapPropDensity = clp(sgConfig.mapPropDensity, 0.35, 2.8);
   sgConfig.mapObstacleCount = clp(Math.round(sgConfig.mapObstacleCount), 40, 500);
+  sgConfig.botFillTargetPlayers = clp(Math.round(sgConfig.botFillTargetPlayers), 1, 30);
+  sgConfig.botFillMaxBots = clp(Math.round(sgConfig.botFillMaxBots), 0, 20);
+  sgConfig.botDifficulty = clp(sgConfig.botDifficulty, 0.2, 3);
   sgConfig.chestTier2Chance = clp(sgConfig.chestTier2Chance, 0, 0.95);
   sgConfig.chestTier3Chance = clp(sgConfig.chestTier3Chance, 0, 0.95);
   sgConfig.borderStartRadius = clp(sgConfig.borderStartRadius, 300, 3000);
