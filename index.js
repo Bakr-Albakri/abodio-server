@@ -282,7 +282,9 @@ const sgConfig = {
   moveSpeed: 340, // units per second
   attackCooldownMs: 700,
   attackRange: 130,
+  attackFovDeg: 155,
   baseDamage: 22,
+  knockback: 90,
   soupHeal: 32,
   compassCooldownSec: 10,
   invisDurationSec: 6,
@@ -290,6 +292,10 @@ const sgConfig = {
   speedBoostMultiplier: 1.55,
   speedBoostDurationSec: 6,
   speedBoostCooldownSec: 30,
+  feastEnabled: true,
+  feastTimeSec: 150,
+  feastAnnounceLeadSec: 25,
+  feastChestCount: 7,
   chestTier2Chance: 0.32,
   chestTier3Chance: 0.12,
   borderStartRadius: 2300,
@@ -319,6 +325,9 @@ const sgMatch = {
   endedAt: 0,
   winnerId: null,
   endReason: '',
+  feastAt: 0,
+  feastTriggered: false,
+  feastAnnounced: false,
   borderRadius: 2300,
 };
 
@@ -445,6 +454,9 @@ function sgResetRound(keepPlayers = true) {
   sgMatch.endedAt = 0;
   sgMatch.winnerId = null;
   sgMatch.endReason = '';
+  sgMatch.feastAt = 0;
+  sgMatch.feastTriggered = false;
+  sgMatch.feastAnnounced = false;
   sgMatch.borderRadius = sgConfig.borderStartRadius;
   sgGen++;
   initSurvivalChests();
@@ -469,6 +481,9 @@ function sgStartMatch() {
   sgMatch.endedAt = 0;
   sgMatch.winnerId = null;
   sgMatch.endReason = '';
+  sgMatch.feastAt = sgMatch.startedAt + Math.max(15, Number(sgConfig.feastTimeSec) || 150) * 1000;
+  sgMatch.feastTriggered = false;
+  sgMatch.feastAnnounced = false;
   sgMatch.borderRadius = sgConfig.borderStartRadius;
   for (const p of sgPlayers.values()) {
     if (!p.spectator) sgResetPlayerForRound(p);
@@ -507,6 +522,24 @@ function sgUpdateBorder(now) {
   }
   const t = (elapsed - delay) / duration;
   sgMatch.borderRadius = startR + (endR - startR) * t;
+}
+
+function sgTriggerFeast() {
+  if (sgMatch.phase !== 'running' || sgMatch.feastTriggered) return;
+  const need = clp(Math.round(Number(sgConfig.feastChestCount) || 7), 1, sgChests.length);
+  const ranked = [...sgChests].sort((a, b) => {
+    const da = dst(a.x, a.y, SG_CENTER.x, SG_CENTER.y);
+    const db = dst(b.x, b.y, SG_CENTER.x, SG_CENTER.y);
+    return da - db;
+  });
+  for (let i = 0; i < need; i++) {
+    const c = ranked[i];
+    c.openedAt = 0;
+    c.nextRefillAt = 0;
+  }
+  sgMatch.feastTriggered = true;
+  sgChestVer++;
+  sgLog('system', 'Feast event is LIVE at center chests');
 }
 
 function sgKillPlayer(victim, killer, cause) {
@@ -603,12 +636,18 @@ function sgTryAttack(attacker) {
   attacker.lastAttack = now;
 
   const range = Math.max(40, Number(sgConfig.attackRange) || 130);
+  const fovDeg = clp(Number(sgConfig.attackFovDeg) || 155, 20, 360);
+  const halfFov = (fovDeg * Math.PI / 180) * 0.5;
   let target = null;
   let best = Infinity;
   for (const p of sgPlayers.values()) {
     if (p.id === attacker.id || !p.alive || p.spectator) continue;
     if (now < p.invulnUntil) continue;
     const d = dst(attacker.x, attacker.y, p.x, p.y);
+    const attackFace = Number.isFinite(attacker.face) ? attacker.face : 0;
+    const aim = Math.atan2(p.y - attacker.y, p.x - attacker.x);
+    const diff = Math.atan2(Math.sin(aim - attackFace), Math.cos(aim - attackFace));
+    if (Math.abs(diff) > halfFov) continue;
     if (d < range && d < best) { best = d; target = p; }
   }
   if (!target) return;
@@ -616,6 +655,17 @@ function sgTryAttack(attacker) {
   const raw = (Number(sgConfig.baseDamage) || 22) + attacker.weaponTier * 7 - target.armorTier * 5;
   const dmg = clp(raw, 5, 80);
   target.hp -= dmg;
+  const kb = clp(Number(sgConfig.knockback) || 90, 0, 400);
+  if (kb > 0) {
+    const dx = target.x - attacker.x;
+    const dy = target.y - attacker.y;
+    const mag = Math.hypot(dx, dy);
+    if (mag > 1e-4) {
+      target.x += (dx / mag) * kb;
+      target.y += (dy / mag) * kb;
+      sgClampPos(target);
+    }
+  }
   target.hitGlowUntil = now + 900;
   if (target.hp <= 0) sgKillPlayer(target, attacker, 'melee');
 }
@@ -642,7 +692,8 @@ function sgTryOpenChest(player) {
   const tier3Chance = clp((Number(sgConfig.chestTier3Chance) || 0.12) + centerBias, 0, 0.95);
   const tier2Chance = clp((Number(sgConfig.chestTier2Chance) || 0.32) + centerBias * 0.8, 0, 0.95);
   const roll = Math.random();
-  const tier = roll < tier3Chance ? 3 : roll < tier3Chance + tier2Chance ? 2 : 1;
+  let tier = roll < tier3Chance ? 3 : roll < tier3Chance + tier2Chance ? 2 : 1;
+  if (sgMatch.phase === 'running' && sgMatch.feastTriggered && distToCenter < 650) tier = Math.max(tier, 3);
 
   const lootSummary = [];
   const heal = 6 + Math.floor(Math.random() * 10) + tier * 4;
@@ -721,6 +772,16 @@ function sgTick() {
     }
   } else if (sgMatch.phase === 'running') {
     sgUpdateBorder(now);
+    if (sgConfig.feastEnabled) {
+      const leadSec = Math.max(3, Math.round(Number(sgConfig.feastAnnounceLeadSec) || 25));
+      if (!sgMatch.feastAnnounced && now >= sgMatch.feastAt - leadSec * 1000 && now < sgMatch.feastAt) {
+        sgMatch.feastAnnounced = true;
+        sgLog('system', `Feast opens in ${Math.max(0, Math.ceil((sgMatch.feastAt - now) / 1000))}s at center`);
+      }
+      if (!sgMatch.feastTriggered && now >= sgMatch.feastAt) {
+        sgTriggerFeast();
+      }
+    }
 
     // Move players and apply border damage.
     for (const p of sgPlayers.values()) {
@@ -767,11 +828,16 @@ function sgMatchPayload() {
   const endRemaining = sgMatch.phase === 'running'
     ? Math.max(0, Math.ceil((sgMatch.endsAt - now) / 1000))
     : 0;
+  const feastRemaining = sgConfig.feastEnabled && sgMatch.phase === 'running' && !sgMatch.feastTriggered
+    ? Math.max(0, Math.ceil((sgMatch.feastAt - now) / 1000))
+    : 0;
   return {
     phase: sgMatch.phase,
     countdownRemaining,
     graceRemaining,
     endRemaining,
+    feastRemaining,
+    feastTriggered: !!sgMatch.feastTriggered,
     borderRadius: Math.round(sgMatch.borderRadius),
     winnerId: sgMatch.winnerId,
     endReason: sgMatch.endReason,
@@ -1386,9 +1452,10 @@ function sgLeave(conn) {
 function sgUpdateConfig(msg) {
   const numeric = [
     'minPlayersToStart', 'countdownSec', 'graceSec', 'matchDurationSec',
-    'moveSpeed', 'attackCooldownMs', 'attackRange', 'baseDamage',
+    'moveSpeed', 'attackCooldownMs', 'attackRange', 'attackFovDeg', 'baseDamage', 'knockback',
     'soupHeal', 'compassCooldownSec', 'invisDurationSec', 'invisCooldownSec',
     'speedBoostMultiplier', 'speedBoostDurationSec', 'speedBoostCooldownSec',
+    'feastTimeSec', 'feastAnnounceLeadSec', 'feastChestCount',
     'chestTier2Chance', 'chestTier3Chance',
     'borderStartRadius', 'borderEndRadius', 'borderShrinkDelaySec', 'borderShrinkDurationSec',
     'borderDamagePerSec', 'chestOpenRange', 'chestRefillSec', 'weaponMaxTier', 'armorMaxTier', 'autoResetSec',
@@ -1400,6 +1467,7 @@ function sgUpdateConfig(msg) {
     sgConfig[k] = v;
   }
   if (msg.lateJoinAsSpectator !== undefined) sgConfig.lateJoinAsSpectator = !!msg.lateJoinAsSpectator;
+  if (msg.feastEnabled !== undefined) sgConfig.feastEnabled = !!msg.feastEnabled;
 
   sgConfig.minPlayersToStart = clp(Math.round(sgConfig.minPlayersToStart), 1, 50);
   sgConfig.countdownSec = clp(Math.round(sgConfig.countdownSec), 3, 60);
@@ -1408,7 +1476,9 @@ function sgUpdateConfig(msg) {
   sgConfig.moveSpeed = clp(sgConfig.moveSpeed, 80, 1200);
   sgConfig.attackCooldownMs = clp(Math.round(sgConfig.attackCooldownMs), 150, 5000);
   sgConfig.attackRange = clp(sgConfig.attackRange, 30, 400);
+  sgConfig.attackFovDeg = clp(sgConfig.attackFovDeg, 20, 360);
   sgConfig.baseDamage = clp(sgConfig.baseDamage, 1, 120);
+  sgConfig.knockback = clp(sgConfig.knockback, 0, 400);
   sgConfig.soupHeal = clp(sgConfig.soupHeal, 1, 100);
   sgConfig.compassCooldownSec = clp(Math.round(sgConfig.compassCooldownSec), 1, 120);
   sgConfig.invisDurationSec = clp(Math.round(sgConfig.invisDurationSec), 1, 60);
@@ -1416,6 +1486,9 @@ function sgUpdateConfig(msg) {
   sgConfig.speedBoostMultiplier = clp(sgConfig.speedBoostMultiplier, 1.01, 4);
   sgConfig.speedBoostDurationSec = clp(Math.round(sgConfig.speedBoostDurationSec), 1, 60);
   sgConfig.speedBoostCooldownSec = clp(Math.round(sgConfig.speedBoostCooldownSec), 1, 240);
+  sgConfig.feastTimeSec = clp(Math.round(sgConfig.feastTimeSec), 15, 1200);
+  sgConfig.feastAnnounceLeadSec = clp(Math.round(sgConfig.feastAnnounceLeadSec), 3, 180);
+  sgConfig.feastChestCount = clp(Math.round(sgConfig.feastChestCount), 1, sgChests.length);
   sgConfig.chestTier2Chance = clp(sgConfig.chestTier2Chance, 0, 0.95);
   sgConfig.chestTier3Chance = clp(sgConfig.chestTier3Chance, 0, 0.95);
   sgConfig.borderStartRadius = clp(sgConfig.borderStartRadius, 300, 3000);
