@@ -317,6 +317,23 @@ const sgConfig = {
   botFillTargetPlayers: 6,
   botFillMaxBots: 8,
   botDifficulty: 1,
+  relicsEnabled: true,
+  relicSpawnIntervalSec: 18,
+  relicLifetimeSec: 75,
+  relicMaxActive: 9,
+  relicPickupRange: 78,
+  shrineEnabled: true,
+  shrineCount: 6,
+  shrineRadius: 92,
+  shrineBuffSec: 18,
+  shrineCooldownSec: 55,
+  passiveRegenPerSec: 2.2,
+  combatRegenDelaySec: 7,
+  stormEnabled: true,
+  stormEverySec: 95,
+  stormDurationSec: 18,
+  stormRadius: 520,
+  stormDamagePerSec: 14,
 };
 
 const sgPlayers = new Map(); // id -> SGPlayer
@@ -371,6 +388,89 @@ let sgMap = { seed: 1337, props: [], pois: [] };
 const SG_MAP_GRID_CELL = 220;
 const sgMapGrid = new Map();
 const SG_MAP_MIN_EDGE = 120;
+const SG_RELIC_TYPES = [
+  {
+    id: 'fury',
+    name: 'Fury Idol',
+    buffSec: 16,
+    hp: 6,
+    weapon: 1,
+  },
+  {
+    id: 'fortify',
+    name: 'Fortify Core',
+    buffSec: 20,
+    hp: 10,
+    armor: 1,
+  },
+  {
+    id: 'swift',
+    name: 'Swift Rune',
+    buffSec: 15,
+    hp: 0,
+    speed: 1,
+  },
+  {
+    id: 'tracker',
+    name: 'Tracker Lens',
+    buffSec: 22,
+    hp: 0,
+    compass: 2,
+  },
+  {
+    id: 'renew',
+    name: 'Renew Ember',
+    buffSec: 18,
+    hp: 14,
+    regen: 1,
+  },
+];
+const SG_SHRINE_TYPES = [
+  { id: 'fury', name: 'Shrine Of Fury', kind: 0, color: '#f87171' },
+  { id: 'fortify', name: 'Shrine Of Fortify', kind: 1, color: '#60a5fa' },
+  { id: 'swift', name: 'Shrine Of Swift', kind: 2, color: '#34d399' },
+  { id: 'tracker', name: 'Shrine Of Tracker', kind: 3, color: '#fde047' },
+];
+let sgRelics = [];
+let sgRelicVer = 0;
+let sgLastBroadcastRelicVer = -1;
+let sgLastRelicSpawnAt = 0;
+let sgShrines = [];
+let sgShrineVer = 0;
+let sgLastBroadcastShrineVer = -1;
+let sgStorm = {
+  active: false,
+  x: SG_CENTER.x,
+  y: SG_CENTER.y,
+  r: 500,
+  startedAt: 0,
+  endsAt: 0,
+  nextAt: 0,
+};
+let sgStormVer = 0;
+let sgLastBroadcastStormVer = -1;
+
+function sgFlagVerRelics() {
+  sgRelicVer++;
+}
+
+function sgFlagVerShrines() {
+  sgShrineVer++;
+}
+
+function sgFlagVerStorm() {
+  sgStormVer++;
+}
+
+function sgPlayerHasBuff(p, buff, now = Date.now()) {
+  if (!p) return false;
+  if (buff === 'fury') return now < (p.furyUntil || 0);
+  if (buff === 'fortify') return now < (p.fortifyUntil || 0);
+  if (buff === 'swift') return now < (p.swiftUntil || 0);
+  if (buff === 'tracker') return now < (p.trackerUntil || 0);
+  if (buff === 'renew') return now < (p.regenBoostUntil || 0);
+  return false;
+}
 
 function sgMkRng(seed) {
   let s = (Math.abs(Math.floor(seed || 1)) >>> 0) || 1;
@@ -607,6 +707,341 @@ function sgGenerateMap(seedInput) {
   sgRebuildMapGrid();
 }
 
+function sgRelicTemplate(typeId) {
+  for (const t of SG_RELIC_TYPES) {
+    if (t.id === typeId) return t;
+  }
+  return SG_RELIC_TYPES[0];
+}
+
+function sgShrineTemplate(typeId) {
+  for (const t of SG_SHRINE_TYPES) {
+    if (t.id === typeId) return t;
+  }
+  return SG_SHRINE_TYPES[0];
+}
+
+function sgClearRelics(reason = 'reset') {
+  if (sgRelics.length === 0) return;
+  sgRelics = [];
+  sgFlagVerRelics();
+  if (reason) sgLog('system', `Relics cleared (${reason})`);
+}
+
+function sgBuildShrines() {
+  const count = clp(Math.round(Number(sgConfig.shrineCount) || 6), 0, 16);
+  const out = [];
+  if (!sgConfig.shrineEnabled || count <= 0) {
+    sgShrines = out;
+    sgFlagVerShrines();
+    return;
+  }
+  const ringR = Math.max(420, Math.min(1900, Math.round(sgConfig.borderStartRadius * 0.72)));
+  for (let i = 0; i < count; i++) {
+    const a = (Math.PI * 2 * i) / count;
+    const rawX = SG_CENTER.x + Math.cos(a) * ringR;
+    const rawY = SG_CENTER.y + Math.sin(a) * ringR;
+    const pos = sgFindFreeSpot(rawX, rawY, 38);
+    const tpl = SG_SHRINE_TYPES[i % SG_SHRINE_TYPES.length];
+    out.push({
+      id: `shr-${i}`,
+      type: tpl.id,
+      x: pos.x,
+      y: pos.y,
+      r: clp(Number(sgConfig.shrineRadius) || 92, 45, 220),
+      nextReadyAt: 0,
+      activations: 0,
+    });
+  }
+  sgShrines = out;
+  sgFlagVerShrines();
+}
+
+function sgSpawnRelic(now = Date.now(), forcedType = '') {
+  if (!sgConfig.relicsEnabled) return null;
+  const maxActive = clp(Math.round(Number(sgConfig.relicMaxActive) || 9), 1, 30);
+  if (sgRelics.length >= maxActive) return null;
+
+  let spot = null;
+  for (let attempt = 0; attempt < 24; attempt++) {
+    let baseX = SG_CENTER.x;
+    let baseY = SG_CENTER.y;
+    if (sgMap.pois.length > 0 && Math.random() < 0.7) {
+      const poi = pick(sgMap.pois);
+      baseX = poi.x + (Math.random() * 240 - 120);
+      baseY = poi.y + (Math.random() * 240 - 120);
+    } else {
+      baseX = SG_MAP_MIN_EDGE + Math.random() * (SG_W - SG_MAP_MIN_EDGE * 2);
+      baseY = SG_MAP_MIN_EDGE + Math.random() * (SG_H - SG_MAP_MIN_EDGE * 2);
+    }
+    const trySpot = sgFindFreeSpot(baseX, baseY, 30);
+    if (dst(trySpot.x, trySpot.y, SG_CENTER.x, SG_CENTER.y) < 150) continue;
+    let tooClose = false;
+    for (const r of sgRelics) {
+      if (dst(trySpot.x, trySpot.y, r.x, r.y) < 140) {
+        tooClose = true;
+        break;
+      }
+    }
+    if (!tooClose) {
+      spot = trySpot;
+      break;
+    }
+  }
+  if (!spot) return null;
+
+  const ttlSec = clp(Math.round(Number(sgConfig.relicLifetimeSec) || 75), 10, 500);
+  const type =
+    forcedType && SG_RELIC_TYPES.some(t => t.id === forcedType)
+      ? forcedType
+      : pick(SG_RELIC_TYPES).id;
+  const tier = Math.random() < 0.1 ? 3 : Math.random() < 0.4 ? 2 : 1;
+  const relic = {
+    id: `rel-${now}-${Math.random().toString(36).slice(2, 6)}`,
+    type,
+    x: spot.x,
+    y: spot.y,
+    tier,
+    spawnAt: now,
+    expiresAt: now + ttlSec * 1000,
+  };
+  sgRelics.push(relic);
+  sgLastRelicSpawnAt = now;
+  sgFlagVerRelics();
+  const tpl = sgRelicTemplate(type);
+  sgLog('system', `${tpl.name} appeared`);
+  return relic;
+}
+
+function sgSpawnRelicWave(count = 3) {
+  let spawned = 0;
+  for (let i = 0; i < count; i++) {
+    if (sgSpawnRelic(Date.now())) spawned++;
+  }
+  if (spawned > 0) sgLog('system', `Relic wave spawned (${spawned})`);
+}
+
+function sgApplyRelicBuff(player, typeId, tier = 1, source = 'relic') {
+  const now = Date.now();
+  if (!player || !player.alive || player.spectator) return false;
+  const tpl = sgRelicTemplate(typeId);
+  const tierMul = clp(tier, 1, 3);
+  const baseSec = clp(Number(sgConfig.shrineBuffSec) || 18, 6, 90);
+  const buffSec = clp((tpl.buffSec || baseSec) + (tierMul - 1) * 4, 6, 120);
+  const until = now + buffSec * 1000;
+
+  if (typeId === 'fury') {
+    player.furyUntil = Math.max(player.furyUntil || 0, until);
+    if ((tpl.weapon || 0) > 0) {
+      player.weaponTier = clp((player.weaponTier || 0) + Math.max(1, Math.floor((tpl.weapon || 1) * tierMul * 0.6)), 0, sgConfig.weaponMaxTier);
+    }
+  } else if (typeId === 'fortify') {
+    player.fortifyUntil = Math.max(player.fortifyUntil || 0, until);
+    if ((tpl.armor || 0) > 0) {
+      player.armorTier = clp((player.armorTier || 0) + Math.max(1, Math.floor((tpl.armor || 1) * tierMul * 0.6)), 0, sgConfig.armorMaxTier);
+    }
+  } else if (typeId === 'swift') {
+    player.swiftUntil = Math.max(player.swiftUntil || 0, until);
+  } else if (typeId === 'tracker') {
+    player.trackerUntil = Math.max(player.trackerUntil || 0, until);
+    player.compassCharges = clp((player.compassCharges || 0) + (tpl.compass || 1) + tierMul - 1, 0, 10);
+  } else if (typeId === 'renew') {
+    player.regenBoostUntil = Math.max(player.regenBoostUntil || 0, until);
+  }
+
+  const heal = Math.round((tpl.hp || 0) + tierMul * 2);
+  if (heal > 0) player.hp = clp(player.hp + heal, 1, SG_MAX_HP);
+  player.lastRelicAt = now;
+  sgLog('ability', `${player.name} empowered by ${tpl.name} (${source})`);
+  return true;
+}
+
+function sgTickRelics(now) {
+  if (!sgConfig.relicsEnabled || sgMatch.phase !== 'running') {
+    if (sgRelics.length > 0) {
+      sgRelics = [];
+      sgFlagVerRelics();
+    }
+    return;
+  }
+
+  const before = sgRelics.length;
+  sgRelics = sgRelics.filter(r => now < r.expiresAt);
+  if (sgRelics.length !== before) sgFlagVerRelics();
+
+  const spawnEveryMs = clp(Math.round(Number(sgConfig.relicSpawnIntervalSec) || 18), 4, 240) * 1000;
+  if (!sgLastRelicSpawnAt) sgLastRelicSpawnAt = now;
+  if (now - sgLastRelicSpawnAt >= spawnEveryMs) {
+    sgSpawnRelic(now);
+  }
+
+  if (sgRelics.length === 0) return;
+  const range = clp(Number(sgConfig.relicPickupRange) || 78, 24, 200);
+  const pickedIds = new Set();
+  for (const p of sgPlayers.values()) {
+    if (!p.alive || p.spectator) continue;
+    let nearest = null;
+    let best = Infinity;
+    for (const r of sgRelics) {
+      if (pickedIds.has(r.id)) continue;
+      const d = dst(p.x, p.y, r.x, r.y);
+      if (d < range && d < best) {
+        best = d;
+        nearest = r;
+      }
+    }
+    if (!nearest) continue;
+    pickedIds.add(nearest.id);
+    sgApplyRelicBuff(p, nearest.type, nearest.tier, 'pickup');
+    sgLog('loot', `${p.name} collected ${sgRelicTemplate(nearest.type).name}`);
+  }
+  if (pickedIds.size > 0) {
+    sgRelics = sgRelics.filter(r => !pickedIds.has(r.id));
+    sgFlagVerRelics();
+  }
+}
+
+function sgTickShrines(now) {
+  if (!sgConfig.shrineEnabled || sgMatch.phase !== 'running') return;
+  if (sgShrines.length === 0) return;
+  for (const s of sgShrines) {
+    if (now < (s.nextReadyAt || 0)) continue;
+    let activator = null;
+    for (const p of sgPlayers.values()) {
+      if (!p.alive || p.spectator) continue;
+      if (dst(p.x, p.y, s.x, s.y) <= s.r) {
+        activator = p;
+        break;
+      }
+    }
+    if (!activator) continue;
+    const buffSec = clp(Math.round(Number(sgConfig.shrineBuffSec) || 18), 6, 120);
+    const cdSec = clp(Math.round(Number(sgConfig.shrineCooldownSec) || 55), 6, 240);
+    sgApplyRelicBuff(activator, s.type, 2, 'shrine');
+    // Shrines also hard-set buff duration so admin tune has clear effect.
+    const until = now + buffSec * 1000;
+    if (s.type === 'fury') activator.furyUntil = Math.max(activator.furyUntil || 0, until);
+    if (s.type === 'fortify') activator.fortifyUntil = Math.max(activator.fortifyUntil || 0, until);
+    if (s.type === 'swift') activator.swiftUntil = Math.max(activator.swiftUntil || 0, until);
+    if (s.type === 'tracker') activator.trackerUntil = Math.max(activator.trackerUntil || 0, until);
+    s.nextReadyAt = now + cdSec * 1000;
+    s.activations = (s.activations || 0) + 1;
+    sgFlagVerShrines();
+    sgLog('system', `${activator.name} captured ${sgShrineTemplate(s.type).name}`);
+  }
+}
+
+function sgTickPassiveRegen(now, dtSec) {
+  if (sgMatch.phase !== 'running') return;
+  const base = clp(Number(sgConfig.passiveRegenPerSec) || 0, 0, 20);
+  if (base <= 0) return;
+  const delaySec = clp(Number(sgConfig.combatRegenDelaySec) || 7, 0, 60);
+  for (const p of sgPlayers.values()) {
+    if (!p.alive || p.spectator) continue;
+    if (p.hp >= SG_MAX_HP) continue;
+    const damagedAgo = now - (p.lastDamagedAt || 0);
+    if (damagedAgo < delaySec * 1000) continue;
+    const boost = sgPlayerHasBuff(p, 'renew', now) ? 1.75 : 1;
+    p.hp = clp(p.hp + base * boost * dtSec, 1, SG_MAX_HP);
+  }
+}
+
+function sgStartStorm(now) {
+  const minR = Math.max(180, Math.round((Number(sgConfig.stormRadius) || 520) * 0.62));
+  const maxR = Math.max(minR + 40, Math.round(Number(sgConfig.stormRadius) || 520));
+  const ring = Math.max(260, Math.round(sgMatch.borderRadius * 0.65));
+  const a = Math.random() * Math.PI * 2;
+  const sx = SG_CENTER.x + Math.cos(a) * ring;
+  const sy = SG_CENTER.y + Math.sin(a) * ring;
+  const pos = sgFindFreeSpot(sx, sy, 36);
+  sgStorm.active = true;
+  sgStorm.x = pos.x;
+  sgStorm.y = pos.y;
+  sgStorm.r = clp(minR + Math.random() * (maxR - minR), 120, 1400);
+  sgStorm.startedAt = now;
+  sgStorm.endsAt = now + clp(Math.round(Number(sgConfig.stormDurationSec) || 18), 4, 180) * 1000;
+  sgStorm.nextAt = 0;
+  sgFlagVerStorm();
+  sgLog('system', 'Arc storm ignited: avoid the charged zone');
+}
+
+function sgStopStorm(now) {
+  if (!sgStorm.active) return;
+  sgStorm.active = false;
+  const everyMs = clp(Math.round(Number(sgConfig.stormEverySec) || 95), 10, 600) * 1000;
+  sgStorm.nextAt = now + everyMs;
+  sgFlagVerStorm();
+  sgLog('system', 'Arc storm dissipated');
+}
+
+function sgTickStorm(now, dtSec) {
+  if (!sgConfig.stormEnabled || sgMatch.phase !== 'running') {
+    if (sgStorm.active) {
+      sgStorm.active = false;
+      sgFlagVerStorm();
+    }
+    return;
+  }
+  if (!sgStorm.nextAt) {
+    const everyMs = clp(Math.round(Number(sgConfig.stormEverySec) || 95), 10, 600) * 1000;
+    sgStorm.nextAt = now + everyMs;
+    sgFlagVerStorm();
+  }
+  if (!sgStorm.active && now >= sgStorm.nextAt) {
+    sgStartStorm(now);
+  }
+  if (!sgStorm.active) return;
+  if (now >= sgStorm.endsAt) {
+    sgStopStorm(now);
+    return;
+  }
+  const dps = clp(Number(sgConfig.stormDamagePerSec) || 14, 1, 100);
+  for (const p of sgPlayers.values()) {
+    if (!p.alive || p.spectator) continue;
+    const d = dst(p.x, p.y, sgStorm.x, sgStorm.y);
+    if (d > sgStorm.r) continue;
+    const mitigation = sgPlayerHasBuff(p, 'fortify', now) ? 0.72 : 1;
+    p.hp -= dps * mitigation * dtSec;
+    p.lastDamagedAt = now;
+    if (p.hp <= 0) sgKillPlayer(p, null, 'storm');
+  }
+}
+
+function serSgRelics() {
+  return sgRelics.map(r => [
+    r.id,
+    r.type,
+    Math.round(r.x),
+    Math.round(r.y),
+    r.tier | 0,
+    r.expiresAt | 0,
+  ]);
+}
+
+function serSgShrines() {
+  return sgShrines.map(s => [
+    s.id,
+    s.type,
+    Math.round(s.x),
+    Math.round(s.y),
+    Math.round(s.r),
+    Math.round(s.nextReadyAt || 0),
+    Math.round(s.activations || 0),
+  ]);
+}
+
+function serSgStorm() {
+  return {
+    active: sgStorm.active ? 1 : 0,
+    x: Math.round(sgStorm.x),
+    y: Math.round(sgStorm.y),
+    r: Math.round(sgStorm.r),
+    startedAt: Math.round(sgStorm.startedAt || 0),
+    endsAt: Math.round(sgStorm.endsAt || 0),
+    nextAt: Math.round(sgStorm.nextAt || 0),
+  };
+}
+
 const SG_BOT_NAMES = [
   'Revenant', 'Spartan', 'Ninja', 'Falcon', 'Rogue', 'Titan', 'Specter', 'Nova', 'Brawler', 'Ranger',
   'Shifter', 'Viper', 'Golem', 'Drifter', 'Hunter', 'Prowler', 'Knight', 'Warden', 'Cyclone', 'Raptor',
@@ -675,6 +1110,13 @@ function sgSpawnBot() {
     nextCompassAt: 0,
     nextSneakyAt: 0,
     nextWeightlessAt: 0,
+    furyUntil: 0,
+    fortifyUntil: 0,
+    swiftUntil: 0,
+    trackerUntil: 0,
+    regenBoostUntil: 0,
+    lastDamagedAt: 0,
+    lastRelicAt: 0,
     lastAttack: 0,
     lastPing: Date.now(),
     joinTime: Date.now(),
@@ -732,8 +1174,25 @@ function sgUpdateBotAI(now) {
     if (now >= (p.bot.nextThinkAt || 0)) {
       let mx = 0;
       let my = 0;
+      let relicTarget = null;
+      let relicDist = Infinity;
+      if (sgMatch.phase === 'running' && sgRelics.length > 0) {
+        for (const r of sgRelics) {
+          const d = dst(p.x, p.y, r.x, r.y);
+          if (d < relicDist) {
+            relicDist = d;
+            relicTarget = r;
+          }
+        }
+      }
       const nearest = sgFindNearestEnemy(p);
-      if (nearest) {
+      if (relicTarget && (p.hp < 65 || Math.random() < 0.24) && relicDist < 620) {
+        const tx = relicTarget.x - p.x;
+        const ty = relicTarget.y - p.y;
+        const dist = Math.max(1, Math.hypot(tx, ty));
+        mx = tx / dist;
+        my = ty / dist;
+      } else if (nearest) {
         const tx = nearest.target.x - p.x;
         const ty = nearest.target.y - p.y;
         const dist = Math.max(1, Math.hypot(tx, ty));
@@ -799,6 +1258,7 @@ function initSurvivalChests() {
 }
 initSurvivalChests();
 sgGenerateMap(sgConfig.mapSeed);
+sgBuildShrines();
 
 function sgAlivePlayers() {
   const out = [];
@@ -859,6 +1319,13 @@ function sgResetPlayerForRound(p) {
   p.nextCompassAt = 0;
   p.nextSneakyAt = 0;
   p.nextWeightlessAt = 0;
+  p.furyUntil = 0;
+  p.fortifyUntil = 0;
+  p.swiftUntil = 0;
+  p.trackerUntil = 0;
+  p.regenBoostUntil = 0;
+  p.lastDamagedAt = 0;
+  p.lastRelicAt = 0;
   p.lastAttack = 0;
 }
 
@@ -884,6 +1351,13 @@ function sgSetSpectator(p) {
   p.nextCompassAt = 0;
   p.nextSneakyAt = 0;
   p.nextWeightlessAt = 0;
+  p.furyUntil = 0;
+  p.fortifyUntil = 0;
+  p.swiftUntil = 0;
+  p.trackerUntil = 0;
+  p.regenBoostUntil = 0;
+  p.lastDamagedAt = 0;
+  p.lastRelicAt = 0;
 }
 
 function sgResetRound(keepPlayers = true) {
@@ -898,8 +1372,19 @@ function sgResetRound(keepPlayers = true) {
   sgMatch.feastTriggered = false;
   sgMatch.feastAnnounced = false;
   sgMatch.borderRadius = sgConfig.borderStartRadius;
+  sgStorm.active = false;
+  sgStorm.startedAt = 0;
+  sgStorm.endsAt = 0;
+  sgStorm.nextAt = 0;
+  sgStorm.x = SG_CENTER.x;
+  sgStorm.y = SG_CENTER.y;
+  sgStorm.r = clp(Number(sgConfig.stormRadius) || 520, 120, 1400);
+  sgFlagVerStorm();
   sgGen++;
   initSurvivalChests();
+  sgClearRelics('round-reset');
+  sgBuildShrines();
+  sgLastRelicSpawnAt = 0;
   if (!keepPlayers) {
     sgPlayers.clear();
     return;
@@ -925,10 +1410,23 @@ function sgStartMatch() {
   sgMatch.feastTriggered = false;
   sgMatch.feastAnnounced = false;
   sgMatch.borderRadius = sgConfig.borderStartRadius;
+  sgClearRelics('match-start');
+  sgLastRelicSpawnAt = sgMatch.startedAt;
+  sgBuildShrines();
+  const stormEveryMs = clp(Math.round(Number(sgConfig.stormEverySec) || 95), 10, 600) * 1000;
+  sgStorm.active = false;
+  sgStorm.startedAt = 0;
+  sgStorm.endsAt = 0;
+  sgStorm.nextAt = sgMatch.startedAt + stormEveryMs;
+  sgStorm.x = SG_CENTER.x;
+  sgStorm.y = SG_CENTER.y;
+  sgStorm.r = clp(Number(sgConfig.stormRadius) || 520, 120, 1400);
+  sgFlagVerStorm();
   for (const p of sgPlayers.values()) {
     if (!p.spectator) sgResetPlayerForRound(p);
     else sgSetSpectator(p);
   }
+  sgSpawnRelicWave(2);
   sgLog('system', 'Survival Games match started');
 }
 
@@ -938,6 +1436,14 @@ function sgEndMatch(winnerId, reason) {
   sgMatch.endedAt = Date.now();
   sgMatch.winnerId = winnerId || null;
   sgMatch.endReason = String(reason || '').slice(0, 60);
+  sgClearRelics('match-end');
+  if (sgStorm.active) {
+    sgStorm.active = false;
+    sgStorm.startedAt = 0;
+    sgStorm.endsAt = 0;
+    sgStorm.nextAt = 0;
+    sgFlagVerStorm();
+  }
   if (winnerId && sgPlayers.has(winnerId)) {
     sgLog('system', `Winner: ${sgPlayers.get(winnerId).name}`);
   } else {
@@ -984,12 +1490,33 @@ function sgTriggerFeast() {
 
 function sgKillPlayer(victim, killer, cause) {
   if (!victim.alive) return;
+  const now = Date.now();
   victim.alive = false;
   victim.hp = 0;
   victim.invisUntil = 0;
   victim.speedUntil = 0;
+  victim.furyUntil = 0;
+  victim.fortifyUntil = 0;
+  victim.swiftUntil = 0;
+  victim.trackerUntil = 0;
+  victim.regenBoostUntil = 0;
+  victim.lastDamagedAt = now;
   victim.deaths = (victim.deaths || 0) + 1;
   if (killer && killer.id !== victim.id) killer.kills = (killer.kills || 0) + 1;
+  if (sgConfig.relicsEnabled && sgMatch.phase === 'running' && Math.random() < 0.22) {
+    const pos = sgFindFreeSpot(victim.x, victim.y, 20);
+    const deathRelic = {
+      id: `rel-${now}-${Math.random().toString(36).slice(2, 6)}`,
+      type: Math.random() < 0.5 ? 'renew' : 'fortify',
+      x: pos.x,
+      y: pos.y,
+      tier: 2,
+      spawnAt: now,
+      expiresAt: now + clp(Math.round(Number(sgConfig.relicLifetimeSec) || 75), 10, 500) * 1000,
+    };
+    sgRelics.push(deathRelic);
+    sgFlagVerRelics();
+  }
   const by = killer && killer.id !== victim.id ? `${killer.name}` : 'Environment';
   sgLog('death', `${victim.name} was eliminated by ${by}${cause ? ` (${cause})` : ''}`);
 }
@@ -1009,13 +1536,17 @@ function sgFindNearestEnemy(player) {
 function sgTryCompass(player, ws) {
   const now = Date.now();
   if (!player || !player.alive || player.spectator) return false;
-  if ((player.compassCharges || 0) <= 0) return false;
+  const trackerBuff = sgPlayerHasBuff(player, 'tracker', now);
+  if ((player.compassCharges || 0) <= 0 && !trackerBuff) return false;
   if (now < (player.nextCompassAt || 0)) return false;
   const nearest = sgFindNearestEnemy(player);
   if (!nearest) return false;
 
-  player.compassCharges = Math.max(0, (player.compassCharges || 0) - 1);
-  player.nextCompassAt = now + Math.max(1, sgConfig.compassCooldownSec) * 1000;
+  if (!trackerBuff || (player.compassCharges || 0) > 0) {
+    player.compassCharges = Math.max(0, (player.compassCharges || 0) - 1);
+  }
+  const cdBase = Math.max(1, sgConfig.compassCooldownSec) * 1000;
+  player.nextCompassAt = now + (trackerBuff ? Math.round(cdBase * 0.62) : cdBase);
   const bearing = Math.atan2(nearest.target.y - player.y, nearest.target.x - player.x);
   safeSend(ws, JSON.stringify({
     t: 'sgcompass',
@@ -1029,11 +1560,13 @@ function sgTryCompass(player, ws) {
 }
 
 function sgTrySoup(player) {
+  const now = Date.now();
   if (!player || !player.alive || player.spectator) return false;
   if ((player.soups || 0) <= 0) return false;
   if (player.hp >= SG_MAX_HP) return false;
   player.soups--;
-  player.hp = clp(player.hp + (Number(sgConfig.soupHeal) || 32), 1, SG_MAX_HP);
+  const heal = (Number(sgConfig.soupHeal) || 32) * (sgPlayerHasBuff(player, 'renew', now) ? 1.2 : 1);
+  player.hp = clp(player.hp + heal, 1, SG_MAX_HP);
   sgLog('loot', `${player.name} consumed soup`);
   return true;
 }
@@ -1071,7 +1604,8 @@ function sgTryAttack(attacker) {
   if (!attacker || !attacker.alive || attacker.spectator) return;
   if (now < (attacker.invisUntil || 0)) attacker.invisUntil = 0; // attacking breaks invis
   if (now < attacker.invulnUntil) return;
-  if (now - (attacker.lastAttack || 0) < sgConfig.attackCooldownMs) return;
+  const attackCd = Math.round((Number(sgConfig.attackCooldownMs) || 700) * (sgPlayerHasBuff(attacker, 'fury', now) ? 0.88 : 1));
+  if (now - (attacker.lastAttack || 0) < attackCd) return;
   if (now < sgMatch.startedAt + sgConfig.graceSec * 1000) return;
   attacker.lastAttack = now;
 
@@ -1093,8 +1627,18 @@ function sgTryAttack(attacker) {
   }
   if (!target) return;
 
-  const raw = (Number(sgConfig.baseDamage) || 22) + attacker.weaponTier * 7 - target.armorTier * 5;
-  const dmg = clp(raw, 5, 80);
+  const baseDamage = Number(sgConfig.baseDamage) || 22;
+  const furyBoost = sgPlayerHasBuff(attacker, 'fury', now) ? 1.28 : 1;
+  const fortifyMitigation = sgPlayerHasBuff(target, 'fortify', now) ? 0.74 : 1;
+  const trackerPrecision = sgPlayerHasBuff(attacker, 'tracker', now) ? 1.08 : 1;
+  const variance = 0.88 + Math.random() * 0.28;
+  const raw =
+    (baseDamage + attacker.weaponTier * 7 - target.armorTier * 5) *
+    furyBoost *
+    trackerPrecision *
+    variance *
+    fortifyMitigation;
+  const dmg = clp(raw, 5, 95);
   target.hp -= dmg;
   const kb = clp(Number(sgConfig.knockback) || 90, 0, 400);
   if (kb > 0) {
@@ -1108,6 +1652,7 @@ function sgTryAttack(attacker) {
     }
   }
   target.hitGlowUntil = now + 900;
+  target.lastDamagedAt = now;
   if (target.hp <= 0) sgKillPlayer(target, attacker, 'melee');
 }
 
@@ -1116,6 +1661,28 @@ function sgTryOpenChest(player) {
   if (!player || !player.alive || player.spectator) return false;
   if (sgMatch.phase !== 'running') return false;
   const openRange = Math.max(30, Number(sgConfig.chestOpenRange) || 95);
+
+  // If a relic is nearby, opening action picks the relic first.
+  let relic = null;
+  let relicIdx = -1;
+  let bestRelic = Infinity;
+  for (let i = 0; i < sgRelics.length; i++) {
+    const r = sgRelics[i];
+    const d = dst(player.x, player.y, r.x, r.y);
+    if (d < openRange && d < bestRelic) {
+      bestRelic = d;
+      relic = r;
+      relicIdx = i;
+    }
+  }
+  if (relic && relicIdx >= 0) {
+    sgApplyRelicBuff(player, relic.type, relic.tier, 'manual-pickup');
+    sgRelics.splice(relicIdx, 1);
+    sgFlagVerRelics();
+    sgLog('loot', `${player.name} claimed ${sgRelicTemplate(relic.type).name}`);
+    return true;
+  }
+
   let chest = null;
   let best = Infinity;
   for (const c of sgChests) {
@@ -1170,6 +1737,23 @@ function sgTryOpenChest(player) {
   if (Math.random() < (tier === 3 ? 0.42 : 0.16)) {
     player.weightlessCharges = clp((player.weightlessCharges || 0) + 1, 0, 5);
     lootSummary.push('💨+1');
+  }
+
+  if (sgConfig.relicsEnabled && Math.random() < (tier === 3 ? 0.34 : tier === 2 ? 0.18 : 0.06)) {
+    const pos = sgFindFreeSpot(chest.x + (Math.random() * 90 - 45), chest.y + (Math.random() * 90 - 45), 18);
+    const relicType = pick(SG_RELIC_TYPES).id;
+    const relic = {
+      id: `rel-${now}-${Math.random().toString(36).slice(2, 6)}`,
+      type: relicType,
+      x: pos.x,
+      y: pos.y,
+      tier: tier >= 3 ? 3 : tier >= 2 ? 2 : 1,
+      spawnAt: now,
+      expiresAt: now + clp(Math.round(Number(sgConfig.relicLifetimeSec) || 75), 10, 500) * 1000,
+    };
+    sgRelics.push(relic);
+    sgFlagVerRelics();
+    lootSummary.push(`✨${sgRelicTemplate(relicType).name}`);
   }
 
   sgLog('loot', `${player.name} looted T${tier} chest (${lootSummary.join(' ')})`);
@@ -1232,6 +1816,8 @@ function sgTick() {
           sgTriggerFeast();
         }
       }
+      sgTickRelics(now);
+      sgTickShrines(now);
     }
 
     // Movement should work in lobby/countdown/running for better playability.
@@ -1242,7 +1828,9 @@ function sgTick() {
         const nx = (p.mx || 0) / mag;
         const ny = (p.my || 0) / mag;
         const speedBoostActive = now < (p.speedUntil || 0);
-        const speedMult = speedBoostActive ? (Number(sgConfig.speedBoostMultiplier) || 1.55) : 1;
+        const swiftBoostActive = sgPlayerHasBuff(p, 'swift', now);
+        let speedMult = speedBoostActive ? (Number(sgConfig.speedBoostMultiplier) || 1.55) : 1;
+        if (swiftBoostActive) speedMult *= 1.18;
         p.x += nx * sgConfig.moveSpeed * speedMult * dtSec;
         p.y += ny * sgConfig.moveSpeed * speedMult * dtSec;
       }
@@ -1251,11 +1839,18 @@ function sgTick() {
       if (sgMatch.phase === 'running') {
         const dd = dst(p.x, p.y, SG_CENTER.x, SG_CENTER.y);
         if (dd > sgMatch.borderRadius) {
-          p.hp -= sgConfig.borderDamagePerSec * dtSec;
+          const fortifyMitigation = sgPlayerHasBuff(p, 'fortify', now) ? 0.78 : 1;
+          p.hp -= sgConfig.borderDamagePerSec * fortifyMitigation * dtSec;
+          p.lastDamagedAt = now;
           if (p.hp <= 0) sgKillPlayer(p, null, 'border');
         }
       }
     }
+  }
+
+  if (sgMatch.phase === 'running') {
+    sgTickStorm(now, dtSec);
+    sgTickPassiveRegen(now, dtSec);
   }
 
   if (sgMatch.phase === 'running') {
@@ -1298,6 +1893,9 @@ function sgMatchPayload() {
     winnerId: sgMatch.winnerId,
     endReason: sgMatch.endReason,
     startedAt: sgMatch.startedAt,
+    relicCount: sgRelics.length,
+    shrineCount: sgShrines.length,
+    storm: serSgStorm(),
   };
 }
 
@@ -1329,6 +1927,13 @@ function serSgPlayers() {
       p.nextSneakyAt || 0,
       p.nextWeightlessAt || 0,
       p.isBot ? 1 : 0,
+      p.furyUntil || 0,
+      p.fortifyUntil || 0,
+      p.swiftUntil || 0,
+      p.trackerUntil || 0,
+      p.regenBoostUntil || 0,
+      p.lastDamagedAt || 0,
+      p.lastRelicAt || 0,
     ]);
   }
   return out;
@@ -1398,6 +2003,13 @@ function sendSurvivalAdminState(ws) {
       nextCompassAt: p.nextCompassAt || 0,
       nextSneakyAt: p.nextSneakyAt || 0,
       nextWeightlessAt: p.nextWeightlessAt || 0,
+      furyUntil: p.furyUntil || 0,
+      fortifyUntil: p.fortifyUntil || 0,
+      swiftUntil: p.swiftUntil || 0,
+      trackerUntil: p.trackerUntil || 0,
+      regenBoostUntil: p.regenBoostUntil || 0,
+      lastDamagedAt: p.lastDamagedAt || 0,
+      lastRelicAt: p.lastRelicAt || 0,
       isBot: !!p.isBot,
       device: p.device || 'Unknown',
     });
@@ -1413,6 +2025,12 @@ function sendSurvivalAdminState(ws) {
     mapSeed: sgMap.seed,
     mapObstacleCount: sgMap.props.length,
     mapPoiCount: sgMap.pois.length,
+    relicCount: sgRelics.length,
+    relicVer: sgRelicVer,
+    shrineCount: sgShrines.length,
+    shrineVer: sgShrineVer,
+    stormVer: sgStormVer,
+    storm: serSgStorm(),
     gen: sgGen,
     events: sgEvents.slice(-120),
   }));
@@ -1873,6 +2491,13 @@ function sgJoin(ws, conn, msg) {
     nextCompassAt: 0,
     nextSneakyAt: 0,
     nextWeightlessAt: 0,
+    furyUntil: 0,
+    fortifyUntil: 0,
+    swiftUntil: 0,
+    trackerUntil: 0,
+    regenBoostUntil: 0,
+    lastDamagedAt: 0,
+    lastRelicAt: 0,
     lastAttack: 0,
     lastPing: Date.now(),
     joinTime: Date.now(),
@@ -1901,6 +2526,12 @@ function sgJoin(ws, conn, msg) {
     ms: sgMap.seed,
     mp: serSgMapProps(),
     poi: serSgPois(),
+    rv: sgRelicVer,
+    r: serSgRelics(),
+    sv: sgShrineVer,
+    sh: serSgShrines(),
+    stv: sgStormVer,
+    st: serSgStorm(),
     lb: mkSgLb(),
     gen: sgGen,
     ev: sgEvents.slice(-20),
@@ -1929,6 +2560,9 @@ function sgUpdateConfig(msg) {
   const prevMapSeed = sgConfig.mapSeed;
   const prevMapDensity = sgConfig.mapPropDensity;
   const prevMapObstacleCount = sgConfig.mapObstacleCount;
+  const prevShrineEnabled = !!sgConfig.shrineEnabled;
+  const prevShrineCount = Number(sgConfig.shrineCount) || 0;
+  const prevShrineRadius = Number(sgConfig.shrineRadius) || 0;
   const numeric = [
     'minPlayersToStart', 'countdownSec', 'graceSec', 'matchDurationSec',
     'moveSpeed', 'attackCooldownMs', 'attackRange', 'attackFovDeg', 'baseDamage', 'knockback', 'spawnInvulnSec',
@@ -1937,6 +2571,10 @@ function sgUpdateConfig(msg) {
     'feastTimeSec', 'feastAnnounceLeadSec', 'feastChestCount',
     'mapSeed', 'mapPropDensity', 'mapObstacleCount',
     'botFillTargetPlayers', 'botFillMaxBots', 'botDifficulty',
+    'relicSpawnIntervalSec', 'relicLifetimeSec', 'relicMaxActive', 'relicPickupRange',
+    'shrineCount', 'shrineRadius', 'shrineBuffSec', 'shrineCooldownSec',
+    'passiveRegenPerSec', 'combatRegenDelaySec',
+    'stormEverySec', 'stormDurationSec', 'stormRadius', 'stormDamagePerSec',
     'chestTier2Chance', 'chestTier3Chance',
     'borderStartRadius', 'borderEndRadius', 'borderShrinkDelaySec', 'borderShrinkDurationSec',
     'borderDamagePerSec', 'chestOpenRange', 'chestRefillSec', 'weaponMaxTier', 'armorMaxTier', 'autoResetSec',
@@ -1950,6 +2588,9 @@ function sgUpdateConfig(msg) {
   if (msg.lateJoinAsSpectator !== undefined) sgConfig.lateJoinAsSpectator = !!msg.lateJoinAsSpectator;
   if (msg.feastEnabled !== undefined) sgConfig.feastEnabled = !!msg.feastEnabled;
   if (msg.botFillEnabled !== undefined) sgConfig.botFillEnabled = !!msg.botFillEnabled;
+  if (msg.relicsEnabled !== undefined) sgConfig.relicsEnabled = !!msg.relicsEnabled;
+  if (msg.shrineEnabled !== undefined) sgConfig.shrineEnabled = !!msg.shrineEnabled;
+  if (msg.stormEnabled !== undefined) sgConfig.stormEnabled = !!msg.stormEnabled;
 
   sgConfig.minPlayersToStart = clp(Math.round(sgConfig.minPlayersToStart), 1, 50);
   sgConfig.countdownSec = clp(Math.round(sgConfig.countdownSec), 3, 60);
@@ -1978,6 +2619,20 @@ function sgUpdateConfig(msg) {
   sgConfig.botFillTargetPlayers = clp(Math.round(sgConfig.botFillTargetPlayers), 1, 30);
   sgConfig.botFillMaxBots = clp(Math.round(sgConfig.botFillMaxBots), 0, 20);
   sgConfig.botDifficulty = clp(sgConfig.botDifficulty, 0.2, 3);
+  sgConfig.relicSpawnIntervalSec = clp(Math.round(sgConfig.relicSpawnIntervalSec), 4, 240);
+  sgConfig.relicLifetimeSec = clp(Math.round(sgConfig.relicLifetimeSec), 10, 500);
+  sgConfig.relicMaxActive = clp(Math.round(sgConfig.relicMaxActive), 1, 30);
+  sgConfig.relicPickupRange = clp(sgConfig.relicPickupRange, 24, 200);
+  sgConfig.shrineCount = clp(Math.round(sgConfig.shrineCount), 0, 16);
+  sgConfig.shrineRadius = clp(sgConfig.shrineRadius, 45, 220);
+  sgConfig.shrineBuffSec = clp(Math.round(sgConfig.shrineBuffSec), 6, 120);
+  sgConfig.shrineCooldownSec = clp(Math.round(sgConfig.shrineCooldownSec), 6, 240);
+  sgConfig.passiveRegenPerSec = clp(sgConfig.passiveRegenPerSec, 0, 20);
+  sgConfig.combatRegenDelaySec = clp(sgConfig.combatRegenDelaySec, 0, 60);
+  sgConfig.stormEverySec = clp(Math.round(sgConfig.stormEverySec), 10, 600);
+  sgConfig.stormDurationSec = clp(Math.round(sgConfig.stormDurationSec), 4, 180);
+  sgConfig.stormRadius = clp(Math.round(sgConfig.stormRadius), 120, 1400);
+  sgConfig.stormDamagePerSec = clp(sgConfig.stormDamagePerSec, 1, 100);
   sgConfig.chestTier2Chance = clp(sgConfig.chestTier2Chance, 0, 0.95);
   sgConfig.chestTier3Chance = clp(sgConfig.chestTier3Chance, 0, 0.95);
   sgConfig.borderStartRadius = clp(sgConfig.borderStartRadius, 300, 3000);
@@ -1996,7 +2651,23 @@ function sgUpdateConfig(msg) {
     sgConfig.mapObstacleCount !== prevMapObstacleCount;
   if (mapChanged) {
     sgGenerateMap(sgConfig.mapSeed);
+    sgBuildShrines();
     sgLog('system', `Map regenerated (seed ${sgConfig.mapSeed}, props ${sgMap.props.length})`);
+  }
+
+  const shrineChanged =
+    !!sgConfig.shrineEnabled !== prevShrineEnabled ||
+    (Number(sgConfig.shrineCount) || 0) !== prevShrineCount ||
+    Math.abs((Number(sgConfig.shrineRadius) || 0) - prevShrineRadius) > 1e-9;
+  if (!mapChanged && shrineChanged) {
+    sgBuildShrines();
+  }
+
+  // Trim relic pool if admin reduced the cap.
+  const maxRelics = clp(Math.round(Number(sgConfig.relicMaxActive) || 9), 1, 30);
+  if (sgRelics.length > maxRelics) {
+    sgRelics = sgRelics.slice(0, maxRelics);
+    sgFlagVerRelics();
   }
 
   if (sgMatch.phase === 'lobby' || sgMatch.phase === 'countdown') {
@@ -2297,6 +2968,8 @@ function handleMessage(ws, conn, msg) {
         if (Number.isFinite(v)) sgConfig.mapSeed = Math.max(1, Math.floor(Math.abs(v)));
       }
       sgGenerateMap(sgConfig.mapSeed);
+      sgBuildShrines();
+      sgClearRelics('map-regenerated');
       sgLog('system', `Map regenerated by admin (seed ${sgConfig.mapSeed})`);
       broadcastSurvival(JSON.stringify({
         t: 'sgmap',
@@ -2304,8 +2977,35 @@ function handleMessage(ws, conn, msg) {
         ms: sgMap.seed,
         mp: serSgMapProps(),
         poi: serSgPois(),
+        sv: sgShrineVer,
+        sh: serSgShrines(),
+        rv: sgRelicVer,
+        r: serSgRelics(),
       }));
       safeSend(ws, JSON.stringify({ t: 'am', ok: 1, action: 'survival_admin_map_regen' }));
+      break;
+    }
+    // ---- Survival Games Admin Spawn Relic Wave ----
+    case 'sgrelicwave': {
+      if (!conn.isAdmin || conn.adminGame !== 'survival-games') return;
+      const count = clp(Math.round(Number(msg.count) || 3), 1, 12);
+      sgSpawnRelicWave(count);
+      safeSend(ws, JSON.stringify({ t: 'am', ok: 1, action: 'survival_admin_relic_wave' }));
+      break;
+    }
+    // ---- Survival Games Admin Clear Relics ----
+    case 'sgrelicclear': {
+      if (!conn.isAdmin || conn.adminGame !== 'survival-games') return;
+      sgClearRelics('admin-clear');
+      safeSend(ws, JSON.stringify({ t: 'am', ok: 1, action: 'survival_admin_relic_clear' }));
+      break;
+    }
+    // ---- Survival Games Admin Rebuild Shrines ----
+    case 'sgshrine': {
+      if (!conn.isAdmin || conn.adminGame !== 'survival-games') return;
+      sgBuildShrines();
+      sgLog('system', 'Shrines rebuilt by admin');
+      safeSend(ws, JSON.stringify({ t: 'am', ok: 1, action: 'survival_admin_shrine_rebuild' }));
       break;
     }
     // ---- Survival Games Admin Start ----
@@ -2675,6 +3375,21 @@ function broadcastSurvivalState() {
     state.mp = serSgMapProps();
     state.poi = serSgPois();
     sgLastBroadcastMapVer = sgMapVer;
+  }
+  if (sgRelicVer !== sgLastBroadcastRelicVer) {
+    state.rv = sgRelicVer;
+    state.r = serSgRelics();
+    sgLastBroadcastRelicVer = sgRelicVer;
+  }
+  if (sgShrineVer !== sgLastBroadcastShrineVer) {
+    state.sv = sgShrineVer;
+    state.sh = serSgShrines();
+    sgLastBroadcastShrineVer = sgShrineVer;
+  }
+  if (sgStormVer !== sgLastBroadcastStormVer) {
+    state.stv = sgStormVer;
+    state.st = serSgStorm();
+    sgLastBroadcastStormVer = sgStormVer;
   }
   if (sgEvents.length > sgLastEventBroadcastLen) {
     state.ev = sgEvents.slice(sgLastEventBroadcastLen).map(e => ({ ts: e.ts, type: e.type, msg: e.msg }));
