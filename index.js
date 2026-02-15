@@ -283,6 +283,15 @@ const sgConfig = {
   attackCooldownMs: 700,
   attackRange: 130,
   baseDamage: 22,
+  soupHeal: 32,
+  compassCooldownSec: 10,
+  invisDurationSec: 6,
+  invisCooldownSec: 35,
+  speedBoostMultiplier: 1.55,
+  speedBoostDurationSec: 6,
+  speedBoostCooldownSec: 30,
+  chestTier2Chance: 0.32,
+  chestTier3Chance: 0.12,
   borderStartRadius: 2300,
   borderEndRadius: 500,
   borderShrinkDelaySec: 90,
@@ -390,7 +399,17 @@ function sgResetPlayerForRound(p) {
   p.hp = SG_MAX_HP;
   p.weaponTier = 0;
   p.armorTier = 0;
+  p.soups = 1;
+  p.compassCharges = 1;
+  p.sneakyCharges = 1;
+  p.weightlessCharges = 1;
   p.invulnUntil = Date.now() + 1200;
+  p.invisUntil = 0;
+  p.speedUntil = 0;
+  p.hitGlowUntil = 0;
+  p.nextCompassAt = 0;
+  p.nextSneakyAt = 0;
+  p.nextWeightlessAt = 0;
   p.lastAttack = 0;
 }
 
@@ -405,7 +424,17 @@ function sgSetSpectator(p) {
   p.hp = 0;
   p.weaponTier = 0;
   p.armorTier = 0;
+  p.soups = 0;
+  p.compassCharges = 0;
+  p.sneakyCharges = 0;
+  p.weightlessCharges = 0;
   p.invulnUntil = 0;
+  p.invisUntil = 0;
+  p.speedUntil = 0;
+  p.hitGlowUntil = 0;
+  p.nextCompassAt = 0;
+  p.nextSneakyAt = 0;
+  p.nextWeightlessAt = 0;
 }
 
 function sgResetRound(keepPlayers = true) {
@@ -484,16 +513,90 @@ function sgKillPlayer(victim, killer, cause) {
   if (!victim.alive) return;
   victim.alive = false;
   victim.hp = 0;
+  victim.invisUntil = 0;
+  victim.speedUntil = 0;
   victim.deaths = (victim.deaths || 0) + 1;
   if (killer && killer.id !== victim.id) killer.kills = (killer.kills || 0) + 1;
   const by = killer && killer.id !== victim.id ? `${killer.name}` : 'Environment';
   sgLog('death', `${victim.name} was eliminated by ${by}${cause ? ` (${cause})` : ''}`);
 }
 
+function sgFindNearestEnemy(player) {
+  if (!player || !player.alive || player.spectator) return null;
+  let best = null;
+  let bestDist = Infinity;
+  for (const p of sgPlayers.values()) {
+    if (p.id === player.id || !p.alive || p.spectator) continue;
+    const d = dst(player.x, player.y, p.x, p.y);
+    if (d < bestDist) { best = p; bestDist = d; }
+  }
+  return best ? { target: best, dist: bestDist } : null;
+}
+
+function sgTryCompass(player, ws) {
+  const now = Date.now();
+  if (!player || !player.alive || player.spectator) return false;
+  if ((player.compassCharges || 0) <= 0) return false;
+  if (now < (player.nextCompassAt || 0)) return false;
+  const nearest = sgFindNearestEnemy(player);
+  if (!nearest) return false;
+
+  player.compassCharges = Math.max(0, (player.compassCharges || 0) - 1);
+  player.nextCompassAt = now + Math.max(1, sgConfig.compassCooldownSec) * 1000;
+  const bearing = Math.atan2(nearest.target.y - player.y, nearest.target.x - player.x);
+  safeSend(ws, JSON.stringify({
+    t: 'sgcompass',
+    target: nearest.target.name,
+    distance: Math.round(nearest.dist),
+    bearing,
+    expiresIn: 5,
+  }));
+  sgLog('info', `${player.name} used tracking compass`);
+  return true;
+}
+
+function sgTrySoup(player) {
+  if (!player || !player.alive || player.spectator) return false;
+  if ((player.soups || 0) <= 0) return false;
+  if (player.hp >= SG_MAX_HP) return false;
+  player.soups--;
+  player.hp = clp(player.hp + (Number(sgConfig.soupHeal) || 32), 1, SG_MAX_HP);
+  sgLog('loot', `${player.name} consumed soup`);
+  return true;
+}
+
+function sgTryAbility(player, ability) {
+  const now = Date.now();
+  if (!player || !player.alive || player.spectator) return false;
+
+  if (ability === 'sneaky') {
+    if ((player.sneakyCharges || 0) <= 0) return false;
+    if (now < (player.nextSneakyAt || 0)) return false;
+    player.sneakyCharges--;
+    player.invisUntil = now + Math.max(1, Number(sgConfig.invisDurationSec) || 6) * 1000;
+    player.nextSneakyAt = now + Math.max(1, Number(sgConfig.invisCooldownSec) || 35) * 1000;
+    sgLog('ability', `${player.name} activated Sneaky`);
+    return true;
+  }
+
+  if (ability === 'weightless') {
+    if ((player.weightlessCharges || 0) <= 0) return false;
+    if (now < (player.nextWeightlessAt || 0)) return false;
+    player.weightlessCharges--;
+    player.speedUntil = now + Math.max(1, Number(sgConfig.speedBoostDurationSec) || 6) * 1000;
+    player.nextWeightlessAt = now + Math.max(1, Number(sgConfig.speedBoostCooldownSec) || 30) * 1000;
+    sgLog('ability', `${player.name} activated Weightless`);
+    return true;
+  }
+
+  return false;
+}
+
 function sgTryAttack(attacker) {
   const now = Date.now();
   if (sgMatch.phase !== 'running') return;
   if (!attacker || !attacker.alive || attacker.spectator) return;
+  if (now < (attacker.invisUntil || 0)) attacker.invisUntil = 0; // attacking breaks invis
   if (now < attacker.invulnUntil) return;
   if (now - (attacker.lastAttack || 0) < sgConfig.attackCooldownMs) return;
   if (now < sgMatch.startedAt + sgConfig.graceSec * 1000) return;
@@ -513,6 +616,7 @@ function sgTryAttack(attacker) {
   const raw = (Number(sgConfig.baseDamage) || 22) + attacker.weaponTier * 7 - target.armorTier * 5;
   const dmg = clp(raw, 5, 80);
   target.hp -= dmg;
+  target.hitGlowUntil = now + 900;
   if (target.hp <= 0) sgKillPlayer(target, attacker, 'melee');
 }
 
@@ -533,11 +637,49 @@ function sgTryOpenChest(player) {
   chest.nextRefillAt = now + Math.max(10, Number(sgConfig.chestRefillSec) || 75) * 1000;
   sgChestVer++;
 
-  const heal = 8 + Math.floor(Math.random() * 22);
-  if (Math.random() < 0.55) player.weaponTier = clp(player.weaponTier + 1, 0, sgConfig.weaponMaxTier);
-  if (Math.random() < 0.4) player.armorTier = clp(player.armorTier + 1, 0, sgConfig.armorMaxTier);
+  const distToCenter = dst(chest.x, chest.y, SG_CENTER.x, SG_CENTER.y);
+  const centerBias = distToCenter < 550 ? 0.2 : distToCenter < 1200 ? 0.08 : 0;
+  const tier3Chance = clp((Number(sgConfig.chestTier3Chance) || 0.12) + centerBias, 0, 0.95);
+  const tier2Chance = clp((Number(sgConfig.chestTier2Chance) || 0.32) + centerBias * 0.8, 0, 0.95);
+  const roll = Math.random();
+  const tier = roll < tier3Chance ? 3 : roll < tier3Chance + tier2Chance ? 2 : 1;
+
+  const lootSummary = [];
+  const heal = 6 + Math.floor(Math.random() * 10) + tier * 4;
   player.hp = clp(player.hp + heal, 1, SG_MAX_HP);
-  sgLog('loot', `${player.name} opened a chest`);
+  lootSummary.push(`+${heal}HP`);
+
+  if (Math.random() < (tier === 3 ? 0.9 : tier === 2 ? 0.65 : 0.42)) {
+    const prev = player.weaponTier || 0;
+    player.weaponTier = clp(prev + 1, 0, sgConfig.weaponMaxTier);
+    if (player.weaponTier > prev) lootSummary.push(`⚔️${player.weaponTier}`);
+  }
+  if (Math.random() < (tier === 3 ? 0.78 : tier === 2 ? 0.52 : 0.34)) {
+    const prev = player.armorTier || 0;
+    player.armorTier = clp(prev + 1, 0, sgConfig.armorMaxTier);
+    if (player.armorTier > prev) lootSummary.push(`🛡️${player.armorTier}`);
+  }
+
+  if (Math.random() < (tier >= 2 ? 0.72 : 0.46)) {
+    const gain = tier === 3 ? 2 : 1;
+    player.soups = clp((player.soups || 0) + gain, 0, 8);
+    lootSummary.push(`🍲+${gain}`);
+  }
+  if (Math.random() < (tier >= 2 ? 0.6 : 0.28)) {
+    const gain = tier === 3 ? 2 : 1;
+    player.compassCharges = clp((player.compassCharges || 0) + gain, 0, 8);
+    lootSummary.push(`🧭+${gain}`);
+  }
+  if (Math.random() < (tier === 3 ? 0.42 : 0.16)) {
+    player.sneakyCharges = clp((player.sneakyCharges || 0) + 1, 0, 5);
+    lootSummary.push('🫥+1');
+  }
+  if (Math.random() < (tier === 3 ? 0.42 : 0.16)) {
+    player.weightlessCharges = clp((player.weightlessCharges || 0) + 1, 0, 5);
+    lootSummary.push('💨+1');
+  }
+
+  sgLog('loot', `${player.name} looted T${tier} chest (${lootSummary.join(' ')})`);
   return true;
 }
 
@@ -587,8 +729,10 @@ function sgTick() {
       if (mag > 1e-3) {
         const nx = (p.mx || 0) / mag;
         const ny = (p.my || 0) / mag;
-        p.x += nx * sgConfig.moveSpeed * dtSec;
-        p.y += ny * sgConfig.moveSpeed * dtSec;
+        const speedBoostActive = now < (p.speedUntil || 0);
+        const speedMult = speedBoostActive ? (Number(sgConfig.speedBoostMultiplier) || 1.55) : 1;
+        p.x += nx * sgConfig.moveSpeed * speedMult * dtSec;
+        p.y += ny * sgConfig.moveSpeed * speedMult * dtSec;
       }
       sgClampPos(p);
       const dd = dst(p.x, p.y, SG_CENTER.x, SG_CENTER.y);
@@ -652,6 +796,16 @@ function serSgPlayers() {
       p.weaponTier || 0,
       p.armorTier || 0,
       p.face || 0,
+      p.soups || 0,
+      p.compassCharges || 0,
+      p.sneakyCharges || 0,
+      p.weightlessCharges || 0,
+      p.invisUntil || 0,
+      p.speedUntil || 0,
+      p.hitGlowUntil || 0,
+      p.nextCompassAt || 0,
+      p.nextSneakyAt || 0,
+      p.nextWeightlessAt || 0,
     ]);
   }
   return out;
@@ -702,6 +856,16 @@ function sendSurvivalAdminState(ws) {
       deaths: p.deaths || 0,
       weaponTier: p.weaponTier || 0,
       armorTier: p.armorTier || 0,
+      soups: p.soups || 0,
+      compassCharges: p.compassCharges || 0,
+      sneakyCharges: p.sneakyCharges || 0,
+      weightlessCharges: p.weightlessCharges || 0,
+      invisUntil: p.invisUntil || 0,
+      speedUntil: p.speedUntil || 0,
+      hitGlowUntil: p.hitGlowUntil || 0,
+      nextCompassAt: p.nextCompassAt || 0,
+      nextSneakyAt: p.nextSneakyAt || 0,
+      nextWeightlessAt: p.nextWeightlessAt || 0,
       device: p.device || 'Unknown',
     });
   }
@@ -1161,7 +1325,17 @@ function sgJoin(ws, conn, msg) {
     deaths: 0,
     weaponTier: 0,
     armorTier: 0,
+    soups: 1,
+    compassCharges: 1,
+    sneakyCharges: 1,
+    weightlessCharges: 1,
     invulnUntil: 0,
+    invisUntil: 0,
+    speedUntil: 0,
+    hitGlowUntil: 0,
+    nextCompassAt: 0,
+    nextSneakyAt: 0,
+    nextWeightlessAt: 0,
     lastAttack: 0,
     lastPing: Date.now(),
     joinTime: Date.now(),
@@ -1213,6 +1387,9 @@ function sgUpdateConfig(msg) {
   const numeric = [
     'minPlayersToStart', 'countdownSec', 'graceSec', 'matchDurationSec',
     'moveSpeed', 'attackCooldownMs', 'attackRange', 'baseDamage',
+    'soupHeal', 'compassCooldownSec', 'invisDurationSec', 'invisCooldownSec',
+    'speedBoostMultiplier', 'speedBoostDurationSec', 'speedBoostCooldownSec',
+    'chestTier2Chance', 'chestTier3Chance',
     'borderStartRadius', 'borderEndRadius', 'borderShrinkDelaySec', 'borderShrinkDurationSec',
     'borderDamagePerSec', 'chestOpenRange', 'chestRefillSec', 'weaponMaxTier', 'armorMaxTier', 'autoResetSec',
   ];
@@ -1232,6 +1409,15 @@ function sgUpdateConfig(msg) {
   sgConfig.attackCooldownMs = clp(Math.round(sgConfig.attackCooldownMs), 150, 5000);
   sgConfig.attackRange = clp(sgConfig.attackRange, 30, 400);
   sgConfig.baseDamage = clp(sgConfig.baseDamage, 1, 120);
+  sgConfig.soupHeal = clp(sgConfig.soupHeal, 1, 100);
+  sgConfig.compassCooldownSec = clp(Math.round(sgConfig.compassCooldownSec), 1, 120);
+  sgConfig.invisDurationSec = clp(Math.round(sgConfig.invisDurationSec), 1, 60);
+  sgConfig.invisCooldownSec = clp(Math.round(sgConfig.invisCooldownSec), 1, 240);
+  sgConfig.speedBoostMultiplier = clp(sgConfig.speedBoostMultiplier, 1.01, 4);
+  sgConfig.speedBoostDurationSec = clp(Math.round(sgConfig.speedBoostDurationSec), 1, 60);
+  sgConfig.speedBoostCooldownSec = clp(Math.round(sgConfig.speedBoostCooldownSec), 1, 240);
+  sgConfig.chestTier2Chance = clp(sgConfig.chestTier2Chance, 0, 0.95);
+  sgConfig.chestTier3Chance = clp(sgConfig.chestTier3Chance, 0, 0.95);
   sgConfig.borderStartRadius = clp(sgConfig.borderStartRadius, 300, 3000);
   sgConfig.borderEndRadius = clp(sgConfig.borderEndRadius, 100, sgConfig.borderStartRadius);
   sgConfig.borderShrinkDelaySec = clp(Math.round(sgConfig.borderShrinkDelaySec), 0, 900);
@@ -1264,6 +1450,27 @@ function handleMessage(ws, conn, msg) {
     case 'sgatk': {
       if (!conn.sgPlayerId) break;
       sgTryAttack(sgPlayers.get(conn.sgPlayerId));
+      break;
+    }
+    // ---- Survival Games Compass ----
+    case 'sgcompass': {
+      if (!conn.sgPlayerId) break;
+      sgTryCompass(sgPlayers.get(conn.sgPlayerId), ws);
+      break;
+    }
+    // ---- Survival Games Soup ----
+    case 'sgsoup': {
+      if (!conn.sgPlayerId) break;
+      sgTrySoup(sgPlayers.get(conn.sgPlayerId));
+      break;
+    }
+    // ---- Survival Games Ability ----
+    case 'sgability': {
+      if (!conn.sgPlayerId) break;
+      const ability = String(msg.a || '');
+      if (ability === 'sneaky' || ability === 'weightless') {
+        sgTryAbility(sgPlayers.get(conn.sgPlayerId), ability);
+      }
       break;
     }
     // ---- Survival Games Open Chest ----
