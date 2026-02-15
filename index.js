@@ -285,6 +285,7 @@ const sgConfig = {
   attackFovDeg: 155,
   baseDamage: 22,
   knockback: 90,
+  spawnInvulnSec: 2.5,
   soupHeal: 32,
   compassCooldownSec: 10,
   invisDurationSec: 6,
@@ -412,7 +413,7 @@ function sgResetPlayerForRound(p) {
   p.compassCharges = 1;
   p.sneakyCharges = 1;
   p.weightlessCharges = 1;
-  p.invulnUntil = Date.now() + 1200;
+  p.invulnUntil = Date.now() + clp((Number(sgConfig.spawnInvulnSec) || 0) * 1000, 0, 20000);
   p.invisUntil = 0;
   p.speedUntil = 0;
   p.hitGlowUntil = 0;
@@ -1453,7 +1454,7 @@ function sgLeave(conn) {
 function sgUpdateConfig(msg) {
   const numeric = [
     'minPlayersToStart', 'countdownSec', 'graceSec', 'matchDurationSec',
-    'moveSpeed', 'attackCooldownMs', 'attackRange', 'attackFovDeg', 'baseDamage', 'knockback',
+    'moveSpeed', 'attackCooldownMs', 'attackRange', 'attackFovDeg', 'baseDamage', 'knockback', 'spawnInvulnSec',
     'soupHeal', 'compassCooldownSec', 'invisDurationSec', 'invisCooldownSec',
     'speedBoostMultiplier', 'speedBoostDurationSec', 'speedBoostCooldownSec',
     'feastTimeSec', 'feastAnnounceLeadSec', 'feastChestCount',
@@ -1480,6 +1481,7 @@ function sgUpdateConfig(msg) {
   sgConfig.attackFovDeg = clp(sgConfig.attackFovDeg, 20, 360);
   sgConfig.baseDamage = clp(sgConfig.baseDamage, 1, 120);
   sgConfig.knockback = clp(sgConfig.knockback, 0, 400);
+  sgConfig.spawnInvulnSec = clp(sgConfig.spawnInvulnSec, 0, 20);
   sgConfig.soupHeal = clp(sgConfig.soupHeal, 1, 100);
   sgConfig.compassCooldownSec = clp(Math.round(sgConfig.compassCooldownSec), 1, 120);
   sgConfig.invisDurationSec = clp(Math.round(sgConfig.invisDurationSec), 1, 60);
