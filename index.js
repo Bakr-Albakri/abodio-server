@@ -45,8 +45,9 @@ const gameConfig = {
   laserWidth: 8,       // beam width in world units
   laserCellKill: false, // laser hit kills touched cell; main hit kills whole player
   bgMusic: BG_MUSIC_RANDOM, // -2=random per join, -1=none, 0-49=fixed track
-  movementStyle: 'pointer', // 'pointer' | 'lastDirection'
+  movementStyle: 'pointer', // 'pointer' | 'lastDirection' | 'screenOffset'
   mobileControlMode: 'classic', // 'classic' | 'landscape' (touch devices only)
+  voiceChatEnabled: false, // enable voice chat relay for connected players
   // ---- Azoz Mode Config ----
   phaseOutTime: PHASE_OUT_DEFAULT, // seconds of invulnerability after join
   endGameMessage: 'You were eaten!', // default end game message (configurable)
@@ -60,7 +61,7 @@ const gameConfig = {
 };
 
 // ---- Grid Shapes (admin-drawn obstacles) ----
-let gridShapes = []; // { type: 'rect'|'circle', x, y, w?, h?, r?, color }
+let gridShapes = []; // { type, x, y, ... }
 const DEFAULT_GRID_CELL_SIZE = 50;
 
 // ---- Red Mushrooms (Azoz Mode special food) ----
@@ -161,6 +162,35 @@ function resolveIntroTrack() {
   if (track === BG_MUSIC_RANDOM) return Math.floor(Math.random() * MUSIC_TRACK_COUNT);
   if (track >= 0 && track < MUSIC_TRACK_COUNT) return Math.floor(track);
   return BG_MUSIC_MUTE;
+}
+
+function sanitizeGridShape(shape) {
+  if (!shape || typeof shape !== 'object') return null;
+  const x = Number(shape.x), y = Number(shape.y);
+  const color = (typeof shape.color === 'string' && shape.color.length <= 20) ? shape.color : '#ffffff';
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  const type = String(shape.type || '');
+  if (type === 'rect') {
+    const w = Number(shape.w), h = Number(shape.h);
+    if (!Number.isFinite(w) || !Number.isFinite(h)) return null;
+    return { type: 'rect', x, y, w: clp(w, 10, 5000), h: clp(h, 10, 5000), color };
+  }
+  if (type === 'circle') {
+    const r = Number(shape.r);
+    if (!Number.isFinite(r)) return null;
+    return { type: 'circle', x, y, r: clp(r, 10, 3000), color };
+  }
+  if (type === 'ellipse') {
+    const rx = Number(shape.rx), ry = Number(shape.ry);
+    if (!Number.isFinite(rx) || !Number.isFinite(ry)) return null;
+    return { type: 'ellipse', x, y, rx: clp(rx, 10, 4000), ry: clp(ry, 10, 4000), color };
+  }
+  if (type === 'triangle') {
+    const size = Number(shape.size);
+    if (!Number.isFinite(size)) return null;
+    return { type: 'triangle', x, y, size: clp(size, 10, 4000), color };
+  }
+  return null;
 }
 
 // ---- Game State ----
@@ -359,11 +389,10 @@ function tick() {
     }
   }
 
-  // ---- Food collisions — BOTS ONLY ----
+  // ---- Food collisions — all players ----
   let foodEatenThisTick = 0;
   const regFoodCap = (gameConfig.gameMode === 'azoz') ? gameConfig.azozMaxFoodMass : MAX_MASS;
   for (const p of players.values()) {
-    if (!p.isBot) continue;
     for (const cell of p.cells) {
       const cr = rad(cell.m), crSq = cr * cr;
       for (let i = 0; i < food.length; i++) {
@@ -381,11 +410,10 @@ function tick() {
   if (foodChanged) foodVer++;
   dbg.foodEaten = foodEatenThisTick;
 
-  // ---- Red Mushroom collisions — BOTS ONLY ----
+  // ---- Red Mushroom collisions — all players ----
   const mushroomActive = gameConfig.gameMode === 'azoz' || gameConfig.redMushroom;
   if (mushroomActive && mushrooms.length > 0) {
     for (const p of players.values()) {
-      if (!p.isBot) continue;
       const pm = tmass(p.cells);
       if (pm < gameConfig.azozMushroomThreshold) continue;
       for (const cell of p.cells) {
@@ -707,6 +735,22 @@ function handleMessage(ws, conn, msg) {
       p.lastPing = Date.now();
       break;
     }
+    // ---- Voice Chat Chunk Relay ----
+    case 'vc': {
+      if (!gameConfig.voiceChatEnabled) return;
+      const p = players.get(conn.playerId);
+      if (!p || p.isBot || p.dead) return;
+      const b64 = typeof msg.d === 'string' ? msg.d : '';
+      if (!b64 || b64.length > 120000) return; // avoid oversized payloads
+      const mime = (typeof msg.mime === 'string' ? msg.mime : 'audio/webm').slice(0, 80);
+      const payload = JSON.stringify({ t: 'vc', pid: p.id, name: p.name, mime, d: b64 });
+      for (const [ows, oc] of connections) {
+        if (ows === ws) continue;
+        if (!oc.playerId) continue;
+        safeSend(ows, payload);
+      }
+      break;
+    }
     // ---- Split ----
     case 's': {
       const p = players.get(conn.playerId);
@@ -939,7 +983,7 @@ function handleMessage(ws, conn, msg) {
       const allowed = ['splitSpeed','splitDecel','wallKill','mergeDelay','decayRate','decayMin',
         'virusCount','virusMass','ejectMass','ejectSpeed','ejectLoss',
         'gameMode','laserCooldown','laserDamage','laserRange','laserLength','laserWidth','laserCellKill','bgMusic',
-        'movementStyle','mobileControlMode',
+        'movementStyle','mobileControlMode','voiceChatEnabled',
         'azozMapRatio','azozMaxFoodMass','azozMushroomThreshold','azozMushroomFlash',
         'azozMushroomLifetime','azozMushroomName','redMushroom',
         'phaseOutTime','endGameMessage'];
@@ -980,12 +1024,16 @@ function handleMessage(ws, conn, msg) {
         }
         if (k === 'movementStyle') {
           const v = String(msg[k]);
-          gameConfig.movementStyle = (v === 'lastDirection') ? 'lastDirection' : 'pointer';
+          gameConfig.movementStyle = (v === 'lastDirection' || v === 'screenOffset') ? v : 'pointer';
           continue;
         }
         if (k === 'mobileControlMode') {
           const v = String(msg[k]);
           gameConfig.mobileControlMode = (v === 'landscape') ? 'landscape' : 'classic';
+          continue;
+        }
+        if (k === 'voiceChatEnabled') {
+          gameConfig.voiceChatEnabled = !!msg[k];
           continue;
         }
         gameConfig[k] = msg[k];
@@ -1014,8 +1062,13 @@ function handleMessage(ws, conn, msg) {
       applyGridSize();
       // Update shapes if provided
       if (Array.isArray(msg.shapes)) {
-        gridShapes = msg.shapes.filter(s => s && (s.type === 'rect' || s.type === 'circle') &&
-          typeof s.x === 'number' && typeof s.y === 'number').slice(0, 50);
+        const next = [];
+        for (const shape of msg.shapes) {
+          const clean = sanitizeGridShape(shape);
+          if (clean) next.push(clean);
+          if (next.length >= 100) break;
+        }
+        gridShapes = next;
       }
       // Broadcast to all players
       broadcast(JSON.stringify({ t: 'gcfg', cfg: gameConfig, shapes: gridShapes }));
