@@ -310,6 +310,9 @@ const sgConfig = {
   armorMaxTier: 3,
   lateJoinAsSpectator: false,
   autoResetSec: 12,
+  mapSeed: 1337,
+  mapPropDensity: 1,
+  mapObstacleCount: 160,
 };
 
 const sgPlayers = new Map(); // id -> SGPlayer
@@ -339,7 +342,266 @@ const SG_CHEST_POINTS = [
   { x: 1000, y: 1700 }, { x: 1700, y: 1000 }, { x: 4200, y: 1700 }, { x: 3500, y: 1000 },
   { x: 1000, y: 3500 }, { x: 1700, y: 4200 }, { x: 4200, y: 3500 }, { x: 3500, y: 4200 },
 ];
+const SG_POI_BLUEPRINTS = [
+  { name: 'Temple Ruins', x: 2600, y: 2600, tier: 3 },
+  { name: 'North Keep', x: 2600, y: 820, tier: 2 },
+  { name: 'South Keep', x: 2600, y: 4380, tier: 2 },
+  { name: 'West Watch', x: 820, y: 2600, tier: 2 },
+  { name: 'East Watch', x: 4380, y: 2600, tier: 2 },
+  { name: 'Sandy Hamlet', x: 1280, y: 1180, tier: 1 },
+  { name: 'Pine Hamlet', x: 3920, y: 1180, tier: 1 },
+  { name: 'Marsh Hamlet', x: 1280, y: 4020, tier: 1 },
+  { name: 'Forge Hamlet', x: 3920, y: 4020, tier: 1 },
+  { name: 'Broken Bridge', x: 1730, y: 970, tier: 1 },
+  { name: 'Bone Camp', x: 3520, y: 970, tier: 1 },
+  { name: 'Moss Camp', x: 1730, y: 4230, tier: 1 },
+  { name: 'Bluff Camp', x: 3520, y: 4230, tier: 1 },
+  { name: 'Sunken Well', x: 930, y: 3480, tier: 1 },
+  { name: 'Windmill Field', x: 4300, y: 1710, tier: 1 },
+];
+
 let sgChests = [];
+let sgMapVer = 0;
+let sgLastBroadcastMapVer = -1;
+let sgMap = { seed: 1337, props: [], pois: [] };
+const SG_MAP_GRID_CELL = 220;
+const sgMapGrid = new Map();
+const SG_MAP_MIN_EDGE = 120;
+
+function sgMkRng(seed) {
+  let s = (Math.abs(Math.floor(seed || 1)) >>> 0) || 1;
+  return () => {
+    s = (s * 1664525 + 1013904223) >>> 0;
+    return s / 4294967296;
+  };
+}
+
+function sgGridKey(cx, cy) {
+  return `${cx}|${cy}`;
+}
+
+function sgMapBounds(prop) {
+  if (!prop) return { minX: 0, maxX: 0, minY: 0, maxY: 0 };
+  if (prop.shape === 'circle') {
+    return {
+      minX: prop.x - prop.r,
+      maxX: prop.x + prop.r,
+      minY: prop.y - prop.r,
+      maxY: prop.y + prop.r,
+    };
+  }
+  return {
+    minX: prop.x - prop.w * 0.5,
+    maxX: prop.x + prop.w * 0.5,
+    minY: prop.y - prop.d * 0.5,
+    maxY: prop.y + prop.d * 0.5,
+  };
+}
+
+function sgRebuildMapGrid() {
+  sgMapGrid.clear();
+  for (let i = 0; i < sgMap.props.length; i++) {
+    const b = sgMapBounds(sgMap.props[i]);
+    const minCX = Math.floor(b.minX / SG_MAP_GRID_CELL);
+    const maxCX = Math.floor(b.maxX / SG_MAP_GRID_CELL);
+    const minCY = Math.floor(b.minY / SG_MAP_GRID_CELL);
+    const maxCY = Math.floor(b.maxY / SG_MAP_GRID_CELL);
+    for (let cx = minCX; cx <= maxCX; cx++) {
+      for (let cy = minCY; cy <= maxCY; cy++) {
+        const k = sgGridKey(cx, cy);
+        let arr = sgMapGrid.get(k);
+        if (!arr) {
+          arr = [];
+          sgMapGrid.set(k, arr);
+        }
+        arr.push(i);
+      }
+    }
+  }
+}
+
+function sgNearbyMapProps(x, y, radius = 140) {
+  const minCX = Math.floor((x - radius) / SG_MAP_GRID_CELL);
+  const maxCX = Math.floor((x + radius) / SG_MAP_GRID_CELL);
+  const minCY = Math.floor((y - radius) / SG_MAP_GRID_CELL);
+  const maxCY = Math.floor((y + radius) / SG_MAP_GRID_CELL);
+  const idxs = new Set();
+  for (let cx = minCX; cx <= maxCX; cx++) {
+    for (let cy = minCY; cy <= maxCY; cy++) {
+      const arr = sgMapGrid.get(sgGridKey(cx, cy));
+      if (!arr) continue;
+      for (const i of arr) idxs.add(i);
+    }
+  }
+  const out = [];
+  for (const i of idxs) out.push(sgMap.props[i]);
+  return out;
+}
+
+function sgPointInProp(x, y, prop, pad = 0) {
+  if (!prop) return false;
+  if (prop.shape === 'circle') {
+    const d2 = (x - prop.x) * (x - prop.x) + (y - prop.y) * (y - prop.y);
+    const r = Math.max(0, prop.r + pad);
+    return d2 <= r * r;
+  }
+  const minX = prop.x - prop.w * 0.5 - pad;
+  const maxX = prop.x + prop.w * 0.5 + pad;
+  const minY = prop.y - prop.d * 0.5 - pad;
+  const maxY = prop.y + prop.d * 0.5 + pad;
+  return x >= minX && x <= maxX && y >= minY && y <= maxY;
+}
+
+function sgPointBlocked(x, y, pad = 0) {
+  const nearby = sgNearbyMapProps(x, y, 120 + pad);
+  for (const p of nearby) {
+    if (sgPointInProp(x, y, p, pad)) return true;
+  }
+  return false;
+}
+
+function sgSegmentBlocked(ax, ay, bx, by, pad = 0) {
+  const d = dst(ax, ay, bx, by);
+  const steps = Math.max(6, Math.ceil(d / 45));
+  for (let i = 1; i < steps; i++) {
+    const t = i / steps;
+    const x = ax + (bx - ax) * t;
+    const y = ay + (by - ay) * t;
+    if (sgPointBlocked(x, y, pad)) return true;
+  }
+  return false;
+}
+
+function sgResolveMapCollision(p, pad = 18) {
+  if (!p) return;
+  for (let pass = 0; pass < 3; pass++) {
+    let moved = false;
+    const nearby = sgNearbyMapProps(p.x, p.y, 180 + pad);
+    for (const o of nearby) {
+      if (o.shape === 'circle') {
+        const dx = p.x - o.x;
+        const dy = p.y - o.y;
+        const rr = o.r + pad;
+        const d = Math.hypot(dx, dy);
+        if (d < rr) {
+          if (d < 1e-4) {
+            const a = ((p.id || '').charCodeAt(0) + pass * 1.73) % (Math.PI * 2);
+            p.x = o.x + Math.cos(a) * rr;
+            p.y = o.y + Math.sin(a) * rr;
+          } else {
+            p.x = o.x + (dx / d) * rr;
+            p.y = o.y + (dy / d) * rr;
+          }
+          moved = true;
+        }
+      } else {
+        const minX = o.x - o.w * 0.5 - pad;
+        const maxX = o.x + o.w * 0.5 + pad;
+        const minY = o.y - o.d * 0.5 - pad;
+        const maxY = o.y + o.d * 0.5 + pad;
+        if (p.x > minX && p.x < maxX && p.y > minY && p.y < maxY) {
+          const dl = Math.abs(p.x - minX);
+          const dr = Math.abs(maxX - p.x);
+          const dt = Math.abs(p.y - minY);
+          const db = Math.abs(maxY - p.y);
+          const m = Math.min(dl, dr, dt, db);
+          if (m === dl) p.x = minX;
+          else if (m === dr) p.x = maxX;
+          else if (m === dt) p.y = minY;
+          else p.y = maxY;
+          moved = true;
+        }
+      }
+      sgClampPos(p);
+    }
+    if (!moved) break;
+  }
+}
+
+function sgFindFreeSpot(x, y, pad = 18) {
+  const out = { x: clp(x, SG_MAP_MIN_EDGE, SG_W - SG_MAP_MIN_EDGE), y: clp(y, SG_MAP_MIN_EDGE, SG_H - SG_MAP_MIN_EDGE) };
+  if (!sgPointBlocked(out.x, out.y, pad)) return out;
+  for (let radius = 26; radius <= 360; radius += 22) {
+    const n = 14 + Math.floor(radius / 22);
+    for (let i = 0; i < n; i++) {
+      const a = (Math.PI * 2 * i) / n;
+      const tx = clp(out.x + Math.cos(a) * radius, SG_MAP_MIN_EDGE, SG_W - SG_MAP_MIN_EDGE);
+      const ty = clp(out.y + Math.sin(a) * radius, SG_MAP_MIN_EDGE, SG_H - SG_MAP_MIN_EDGE);
+      if (!sgPointBlocked(tx, ty, pad)) return { x: tx, y: ty };
+    }
+  }
+  return out;
+}
+
+function serSgMapProps() {
+  const out = [];
+  for (const p of sgMap.props) {
+    if (p.shape === 'circle') out.push([p.id, 0, Math.round(p.x), Math.round(p.y), Math.round(p.r), Math.round(p.h), p.kind | 0]);
+    else out.push([p.id, 1, Math.round(p.x), Math.round(p.y), Math.round(p.w), Math.round(p.d), Math.round(p.h), p.kind | 0]);
+  }
+  return out;
+}
+
+function serSgPois() {
+  return sgMap.pois.map(p => [p.id, p.name, Math.round(p.x), Math.round(p.y), p.tier | 0]);
+}
+
+function sgGenerateMap(seedInput) {
+  const seed = (Math.abs(Math.floor(seedInput ?? sgConfig.mapSeed ?? 1337)) >>> 0) || 1;
+  const rnd = sgMkRng(seed);
+  const pois = SG_POI_BLUEPRINTS.map((p, i) => ({
+    id: `poi-${i}`,
+    name: p.name,
+    x: p.x,
+    y: p.y,
+    tier: p.tier,
+  }));
+  const avoid = [{ x: SG_CENTER.x, y: SG_CENTER.y, r: 340 }];
+  for (const c of SG_CHEST_POINTS) avoid.push({ x: c.x, y: c.y, r: 150 });
+  for (const p of pois) avoid.push({ x: p.x, y: p.y, r: 110 });
+
+  const targetCountBase = Number(sgConfig.mapObstacleCount) || 160;
+  const density = Number(sgConfig.mapPropDensity) || 1;
+  const targetCount = clp(Math.round(targetCountBase * density), 40, 500);
+  const props = [];
+  let attempts = 0;
+  while (props.length < targetCount && attempts < targetCount * 32) {
+    attempts++;
+    const circle = rnd() < 0.52;
+    const x = SG_MAP_MIN_EDGE + rnd() * (SG_W - SG_MAP_MIN_EDGE * 2);
+    const y = SG_MAP_MIN_EDGE + rnd() * (SG_H - SG_MAP_MIN_EDGE * 2);
+    const h = circle ? 14 + rnd() * 24 : 18 + rnd() * 34;
+    const kind = Math.floor(rnd() * 6);
+    let rawR = circle ? 24 + rnd() * 54 : 0;
+    let rawW = circle ? 0 : 38 + rnd() * 108;
+    let rawD = circle ? 0 : 38 + rnd() * 108;
+    const proxyR = circle ? rawR : Math.max(rawW, rawD) * 0.58;
+
+    let blocked = false;
+    for (const a of avoid) {
+      if (dst(x, y, a.x, a.y) < a.r + proxyR + 10) { blocked = true; break; }
+    }
+    if (blocked) continue;
+
+    // Prevent dense obstacle clumps to preserve pathing.
+    const recent = props.slice(-50);
+    for (const o of recent) {
+      const oProxy = o.shape === 'circle' ? o.r : Math.max(o.w, o.d) * 0.58;
+      if (dst(x, y, o.x, o.y) < (proxyR + oProxy) * 0.8) { blocked = true; break; }
+    }
+    if (blocked) continue;
+
+    if (circle) {
+      props.push({ id: `m-${props.length}`, shape: 'circle', x, y, r: rawR, h, kind });
+    } else {
+      props.push({ id: `m-${props.length}`, shape: 'rect', x, y, w: rawW, d: rawD, h, kind });
+    }
+  }
+
+  sgMap = { seed, props, pois };
+  sgMapVer++;
+  sgRebuildMapGrid();
+}
 
 function sgLog(type, msg) {
   sgEvents.push({ ts: Date.now(), type, msg: String(msg || '').slice(0, 140) });
@@ -361,6 +623,7 @@ function initSurvivalChests() {
   sgChestVer++;
 }
 initSurvivalChests();
+sgGenerateMap(sgConfig.mapSeed);
 
 function sgAlivePlayers() {
   const out = [];
@@ -394,7 +657,8 @@ function sgPickSpawn() {
     for (const p of alive) minD = Math.min(minD, dst(candidate.x, candidate.y, p.x, p.y));
     if (!best || minD > best.minD) best = { ...candidate, minD };
   }
-  return best ? { x: best.x, y: best.y } : { x: SG_CENTER.x, y: SG_CENTER.y };
+  const raw = best ? { x: best.x, y: best.y } : { x: SG_CENTER.x, y: SG_CENTER.y };
+  return sgFindFreeSpot(raw.x, raw.y, 22);
 }
 
 function sgResetPlayerForRound(p) {
@@ -645,6 +909,7 @@ function sgTryAttack(attacker) {
     if (p.id === attacker.id || !p.alive || p.spectator) continue;
     if (now < p.invulnUntil) continue;
     const d = dst(attacker.x, attacker.y, p.x, p.y);
+    if (sgSegmentBlocked(attacker.x, attacker.y, p.x, p.y, 3)) continue;
     const attackFace = Number.isFinite(attacker.face) ? attacker.face : 0;
     const aim = Math.atan2(p.y - attacker.y, p.x - attacker.x);
     const diff = Math.atan2(Math.sin(aim - attackFace), Math.cos(aim - attackFace));
@@ -802,6 +1067,7 @@ function sgTick() {
         p.x += nx * sgConfig.moveSpeed * speedMult * dtSec;
         p.y += ny * sgConfig.moveSpeed * speedMult * dtSec;
       }
+      sgResolveMapCollision(p, 18);
       sgClampPos(p);
       if (sgMatch.phase === 'running') {
         const dd = dst(p.x, p.y, SG_CENTER.x, SG_CENTER.y);
@@ -898,6 +1164,15 @@ function serSgChests() {
   ]);
 }
 
+function serSgMap() {
+  return {
+    ver: sgMapVer,
+    seed: sgMap.seed,
+    p: serSgMapProps(),
+    poi: serSgPois(),
+  };
+}
+
 function mkSgLb() {
   const lb = [];
   for (const p of sgPlayers.values()) {
@@ -953,6 +1228,10 @@ function sendSurvivalAdminState(ws) {
     match: sgMatchPayload(),
     chestCount: sgChests.length,
     chestVer: sgChestVer,
+    mapVer: sgMapVer,
+    mapSeed: sgMap.seed,
+    mapObstacleCount: sgMap.props.length,
+    mapPoiCount: sgMap.pois.length,
     gen: sgGen,
     events: sgEvents.slice(-120),
   }));
@@ -1437,6 +1716,10 @@ function sgJoin(ws, conn, msg) {
     match: sgMatchPayload(),
     p: serSgPlayers(),
     c: serSgChests(),
+    mv: sgMapVer,
+    ms: sgMap.seed,
+    mp: serSgMapProps(),
+    poi: serSgPois(),
     lb: mkSgLb(),
     gen: sgGen,
     ev: sgEvents.slice(-20),
@@ -1462,12 +1745,16 @@ function sgLeave(conn) {
 }
 
 function sgUpdateConfig(msg) {
+  const prevMapSeed = sgConfig.mapSeed;
+  const prevMapDensity = sgConfig.mapPropDensity;
+  const prevMapObstacleCount = sgConfig.mapObstacleCount;
   const numeric = [
     'minPlayersToStart', 'countdownSec', 'graceSec', 'matchDurationSec',
     'moveSpeed', 'attackCooldownMs', 'attackRange', 'attackFovDeg', 'baseDamage', 'knockback', 'spawnInvulnSec',
     'soupHeal', 'compassCooldownSec', 'invisDurationSec', 'invisCooldownSec',
     'speedBoostMultiplier', 'speedBoostDurationSec', 'speedBoostCooldownSec',
     'feastTimeSec', 'feastAnnounceLeadSec', 'feastChestCount',
+    'mapSeed', 'mapPropDensity', 'mapObstacleCount',
     'chestTier2Chance', 'chestTier3Chance',
     'borderStartRadius', 'borderEndRadius', 'borderShrinkDelaySec', 'borderShrinkDurationSec',
     'borderDamagePerSec', 'chestOpenRange', 'chestRefillSec', 'weaponMaxTier', 'armorMaxTier', 'autoResetSec',
@@ -1502,6 +1789,9 @@ function sgUpdateConfig(msg) {
   sgConfig.feastTimeSec = clp(Math.round(sgConfig.feastTimeSec), 15, 1200);
   sgConfig.feastAnnounceLeadSec = clp(Math.round(sgConfig.feastAnnounceLeadSec), 3, 180);
   sgConfig.feastChestCount = clp(Math.round(sgConfig.feastChestCount), 1, sgChests.length);
+  sgConfig.mapSeed = Math.max(1, Math.floor(Math.abs(sgConfig.mapSeed || 1337)));
+  sgConfig.mapPropDensity = clp(sgConfig.mapPropDensity, 0.35, 2.8);
+  sgConfig.mapObstacleCount = clp(Math.round(sgConfig.mapObstacleCount), 40, 500);
   sgConfig.chestTier2Chance = clp(sgConfig.chestTier2Chance, 0, 0.95);
   sgConfig.chestTier3Chance = clp(sgConfig.chestTier3Chance, 0, 0.95);
   sgConfig.borderStartRadius = clp(sgConfig.borderStartRadius, 300, 3000);
@@ -1514,6 +1804,14 @@ function sgUpdateConfig(msg) {
   sgConfig.weaponMaxTier = clp(Math.round(sgConfig.weaponMaxTier), 0, 10);
   sgConfig.armorMaxTier = clp(Math.round(sgConfig.armorMaxTier), 0, 10);
   sgConfig.autoResetSec = clp(Math.round(sgConfig.autoResetSec), 5, 180);
+
+  const mapChanged = sgConfig.mapSeed !== prevMapSeed ||
+    Math.abs((sgConfig.mapPropDensity || 0) - (prevMapDensity || 0)) > 1e-9 ||
+    sgConfig.mapObstacleCount !== prevMapObstacleCount;
+  if (mapChanged) {
+    sgGenerateMap(sgConfig.mapSeed);
+    sgLog('system', `Map regenerated (seed ${sgConfig.mapSeed}, props ${sgMap.props.length})`);
+  }
 
   if (sgMatch.phase === 'lobby' || sgMatch.phase === 'countdown') {
     sgMatch.borderRadius = sgConfig.borderStartRadius;
@@ -1803,6 +2101,25 @@ function handleMessage(ws, conn, msg) {
       sgUpdateConfig(msg);
       broadcastSurvival(JSON.stringify({ t: 'sgcfg', cfg: sgConfig }));
       safeSend(ws, JSON.stringify({ t: 'am', ok: 1, action: 'survival_admin_config' }));
+      break;
+    }
+    // ---- Survival Games Admin Map Regenerate ----
+    case 'sgmap': {
+      if (!conn.isAdmin || conn.adminGame !== 'survival-games') return;
+      if (msg.seed !== undefined) {
+        const v = Number(msg.seed);
+        if (Number.isFinite(v)) sgConfig.mapSeed = Math.max(1, Math.floor(Math.abs(v)));
+      }
+      sgGenerateMap(sgConfig.mapSeed);
+      sgLog('system', `Map regenerated by admin (seed ${sgConfig.mapSeed})`);
+      broadcastSurvival(JSON.stringify({
+        t: 'sgmap',
+        mv: sgMapVer,
+        ms: sgMap.seed,
+        mp: serSgMapProps(),
+        poi: serSgPois(),
+      }));
+      safeSend(ws, JSON.stringify({ t: 'am', ok: 1, action: 'survival_admin_map_regen' }));
       break;
     }
     // ---- Survival Games Admin Start ----
@@ -2166,6 +2483,13 @@ function broadcastSurvivalState() {
     cfg: sgConfig,
     gen: sgGen,
   };
+  if (sgMapVer !== sgLastBroadcastMapVer) {
+    state.mv = sgMapVer;
+    state.ms = sgMap.seed;
+    state.mp = serSgMapProps();
+    state.poi = serSgPois();
+    sgLastBroadcastMapVer = sgMapVer;
+  }
   if (sgEvents.length > sgLastEventBroadcastLen) {
     state.ev = sgEvents.slice(sgLastEventBroadcastLen).map(e => ({ ts: e.ts, type: e.type, msg: e.msg }));
     sgLastEventBroadcastLen = sgEvents.length;
