@@ -674,6 +674,7 @@ function sgTryAttack(attacker) {
 function sgTryOpenChest(player) {
   const now = Date.now();
   if (!player || !player.alive || player.spectator) return false;
+  if (sgMatch.phase !== 'running') return false;
   const openRange = Math.max(30, Number(sgConfig.chestOpenRange) || 95);
   let chest = null;
   let best = Infinity;
@@ -771,20 +772,25 @@ function sgTick() {
     } else if (now >= sgMatch.countdownEndsAt) {
       sgStartMatch();
     }
-  } else if (sgMatch.phase === 'running') {
-    sgUpdateBorder(now);
-    if (sgConfig.feastEnabled) {
-      const leadSec = Math.max(3, Math.round(Number(sgConfig.feastAnnounceLeadSec) || 25));
-      if (!sgMatch.feastAnnounced && now >= sgMatch.feastAt - leadSec * 1000 && now < sgMatch.feastAt) {
-        sgMatch.feastAnnounced = true;
-        sgLog('system', `Feast opens in ${Math.max(0, Math.ceil((sgMatch.feastAt - now) / 1000))}s at center`);
-      }
-      if (!sgMatch.feastTriggered && now >= sgMatch.feastAt) {
-        sgTriggerFeast();
+  }
+
+  const canMove = sgMatch.phase === 'lobby' || sgMatch.phase === 'countdown' || sgMatch.phase === 'running';
+  if (canMove) {
+    if (sgMatch.phase === 'running') {
+      sgUpdateBorder(now);
+      if (sgConfig.feastEnabled) {
+        const leadSec = Math.max(3, Math.round(Number(sgConfig.feastAnnounceLeadSec) || 25));
+        if (!sgMatch.feastAnnounced && now >= sgMatch.feastAt - leadSec * 1000 && now < sgMatch.feastAt) {
+          sgMatch.feastAnnounced = true;
+          sgLog('system', `Feast opens in ${Math.max(0, Math.ceil((sgMatch.feastAt - now) / 1000))}s at center`);
+        }
+        if (!sgMatch.feastTriggered && now >= sgMatch.feastAt) {
+          sgTriggerFeast();
+        }
       }
     }
 
-    // Move players and apply border damage.
+    // Movement should work in lobby/countdown/running for better playability.
     for (const p of sgPlayers.values()) {
       if (!p.alive || p.spectator) continue;
       const mag = Math.hypot(p.mx || 0, p.my || 0);
@@ -797,13 +803,17 @@ function sgTick() {
         p.y += ny * sgConfig.moveSpeed * speedMult * dtSec;
       }
       sgClampPos(p);
-      const dd = dst(p.x, p.y, SG_CENTER.x, SG_CENTER.y);
-      if (dd > sgMatch.borderRadius) {
-        p.hp -= sgConfig.borderDamagePerSec * dtSec;
-        if (p.hp <= 0) sgKillPlayer(p, null, 'border');
+      if (sgMatch.phase === 'running') {
+        const dd = dst(p.x, p.y, SG_CENTER.x, SG_CENTER.y);
+        if (dd > sgMatch.borderRadius) {
+          p.hp -= sgConfig.borderDamagePerSec * dtSec;
+          if (p.hp <= 0) sgKillPlayer(p, null, 'border');
+        }
       }
     }
+  }
 
+  if (sgMatch.phase === 'running') {
     const alive = sgAlivePlayers();
     if (alive.length <= 1) {
       sgEndMatch(alive[0] ? alive[0].id : null, 'last-alive');
