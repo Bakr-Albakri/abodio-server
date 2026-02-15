@@ -17,7 +17,7 @@ const PHASE_OUT_DEFAULT = 2.5; // seconds of invulnerability after join/respawn
 const SPLIT_COOLDOWN_MS = 140;
 const BG_MUSIC_MUTE = -1;
 const BG_MUSIC_RANDOM = -2;
-const MUSIC_TRACK_COUNT = 20;
+const MUSIC_TRACK_COUNT = 50;
 const CLR = ['#FF6B6B','#4ECDC4','#45B7D1','#96CEB4','#FFEAA7','#DDA0DD','#98D8C8','#F7DC6F','#BB8FCE','#85C1E9','#F8B500','#FF69B4'];
 const FCLR = ['#FF6B6B','#4ECDC4','#45B7D1','#96CEB4','#FFEAA7','#DDA0DD','#98D8C8','#F7DC6F'];
 
@@ -41,7 +41,9 @@ const gameConfig = {
   laserCooldown: 3,    // seconds between laser shots
   laserDamage: 15,     // mass removed per laser hit
   laserRange: 400,     // max laser range in world units
-  bgMusic: BG_MUSIC_RANDOM, // -2=random per join, -1=none, 0-19=fixed track
+  bgMusic: BG_MUSIC_RANDOM, // -2=random per join, -1=none, 0-49=fixed track
+  movementStyle: 'pointer', // 'pointer' | 'lastDirection'
+  mobileControlMode: 'classic', // 'classic' | 'landscape' (touch devices only)
   // ---- Azoz Mode Config ----
   phaseOutTime: PHASE_OUT_DEFAULT, // seconds of invulnerability after join
   endGameMessage: 'You were eaten!', // default end game message (configurable)
@@ -898,6 +900,7 @@ function handleMessage(ws, conn, msg) {
       const allowed = ['splitSpeed','splitDecel','wallKill','mergeDelay','decayRate','decayMin',
         'virusCount','virusMass','ejectMass','ejectSpeed','ejectLoss',
         'gameMode','laserCooldown','laserDamage','laserRange','bgMusic',
+        'movementStyle','mobileControlMode',
         'azozMapRatio','azozMaxFoodMass','azozMushroomThreshold','azozMushroomFlash',
         'azozMushroomLifetime','azozMushroomName','redMushroom',
         'phaseOutTime','endGameMessage'];
@@ -916,6 +919,16 @@ function handleMessage(ws, conn, msg) {
         if (k === 'bgMusic') {
           const v = Math.floor(Number(msg[k]));
           if (Number.isFinite(v)) gameConfig.bgMusic = clp(v, BG_MUSIC_RANDOM, MUSIC_TRACK_COUNT - 1);
+          continue;
+        }
+        if (k === 'movementStyle') {
+          const v = String(msg[k]);
+          gameConfig.movementStyle = (v === 'lastDirection') ? 'lastDirection' : 'pointer';
+          continue;
+        }
+        if (k === 'mobileControlMode') {
+          const v = String(msg[k]);
+          gameConfig.mobileControlMode = (v === 'landscape') ? 'landscape' : 'classic';
           continue;
         }
         gameConfig[k] = msg[k];
