@@ -41,6 +41,9 @@ const gameConfig = {
   laserCooldown: 3,    // seconds between laser shots
   laserDamage: 15,     // mass removed per laser hit
   laserRange: 400,     // max laser range in world units
+  laserLength: 400,    // max beam length in world units
+  laserWidth: 8,       // beam width in world units
+  laserCellKill: false, // laser hit kills touched cell; main hit kills whole player
   bgMusic: BG_MUSIC_RANDOM, // -2=random per join, -1=none, 0-49=fixed track
   movementStyle: 'pointer', // 'pointer' | 'lastDirection'
   mobileControlMode: 'classic', // 'classic' | 'landscape' (touch devices only)
@@ -760,19 +763,27 @@ function handleMessage(ws, conn, msg) {
       // Calculate laser line from player center toward angle
       const c = com(p.cells);
       const angle = typeof msg.angle === 'number' ? msg.angle : 0;
-      const range = gameConfig.laserRange;
+      const lengthRaw = Number(gameConfig.laserLength ?? gameConfig.laserRange);
+      const range = Number.isFinite(lengthRaw) ? clp(lengthRaw, 50, 5000) : 400;
+      const widthRaw = Number(gameConfig.laserWidth);
+      const beamWidth = Number.isFinite(widthRaw) ? clp(widthRaw, 1, 200) : 8;
+      const killMode = !!gameConfig.laserCellKill;
       const ex = c.x + Math.cos(angle) * range;
       const ey = c.y + Math.sin(angle) * range;
+      const dx = ex - c.x;
+      const dy = ey - c.y;
+      const a2 = dx * dx + dy * dy;
+      if (a2 <= 1e-6) return;
       // Check hits against all other players
       const hits = [];
       for (const [vid, vp] of players) {
         if (vid === p.id) continue;
+        if (vp.phaseOutUntil && now < vp.phaseOutUntil) continue;
+        const touched = [];
         for (const cell of vp.cells) {
           // Point-to-segment distance check
-          const cr = rad(cell.m);
-          const dx = ex - c.x, dy = ey - c.y;
+          const cr = rad(cell.m) + beamWidth * 0.5;
           const fx = c.x - cell.x, fy = c.y - cell.y;
-          const a2 = dx * dx + dy * dy;
           const b2 = 2 * (fx * dx + fy * dy);
           const c2 = fx * fx + fy * fy - cr * cr;
           let disc = b2 * b2 - 4 * a2 * c2;
@@ -780,12 +791,33 @@ function handleMessage(ws, conn, msg) {
             disc = Math.sqrt(disc);
             const t1 = (-b2 - disc) / (2 * a2);
             const t2 = (-b2 + disc) / (2 * a2);
-            if ((t1 >= 0 && t1 <= 1) || (t2 >= 0 && t2 <= 1) || (t1 < 0 && t2 > 1)) {
-              // Hit! Remove mass
-              const dmg = Math.min(cell.m - 1, gameConfig.laserDamage);
-              cell.m -= dmg;
-              hits.push({ pid: vid, cid: cell.id, dmg });
-            }
+            if ((t1 >= 0 && t1 <= 1) || (t2 >= 0 && t2 <= 1) || (t1 < 0 && t2 > 1)) touched.push(cell);
+          }
+        }
+        if (touched.length === 0) continue;
+
+        if (killMode) {
+          // Main cell is the largest current cell. Hitting it wipes the whole player.
+          let main = vp.cells[0] || null;
+          for (const cell of vp.cells) {
+            if (!main || cell.m > main.m) main = cell;
+          }
+          const hitMain = !!main && touched.some(cell => cell.id === main.id);
+          if (hitMain) {
+            const removed = vp.cells.length;
+            vp.cells = [];
+            for (let i = 0; i < Math.max(1, removed); i++) hits.push({ pid: vid, cid: main ? main.id : 'main', k: 'main' });
+            continue;
+          }
+          const touchedIds = new Set(touched.map(cell => cell.id));
+          vp.cells = vp.cells.filter(cell => !touchedIds.has(cell.id));
+          for (const cell of touched) hits.push({ pid: vid, cid: cell.id, k: 'cell' });
+        } else {
+          for (const cell of touched) {
+            const dmg = Math.min(cell.m - 1, gameConfig.laserDamage);
+            if (dmg <= 0) continue;
+            cell.m -= dmg;
+            hits.push({ pid: vid, cid: cell.id, dmg });
           }
         }
       }
@@ -795,6 +827,7 @@ function handleMessage(ws, conn, msg) {
         from: { x: Math.round(c.x), y: Math.round(c.y) },
         to: { x: Math.round(ex), y: Math.round(ey) },
         color: p.color,
+        width: beamWidth,
         pid: p.id,
         hits: hits.length,
       }));
@@ -838,18 +871,24 @@ function handleMessage(ws, conn, msg) {
     // ---- Admin Add Bot ----
     case 'ab': {
       if (!conn.isAdmin) return;
-      const botName = ((msg.name || '').trim() || '🤖 Bot').slice(0, 20);
-      const botMass = Math.max(SM, Math.min(msg.mass || 50, 10000));
-      const botId = `bot-${uid()}`;
+      const playerType = String(msg.playerType || 'bot') === 'human' ? 'human' : 'bot';
+      const isBot = playerType === 'bot';
+      const defaultName = isBot ? '🤖 Bot' : '👤 Guest';
+      const spawnName = ((msg.name || '').trim() || defaultName).slice(0, 20);
+      const spawnMass = Math.max(SM, Math.min(msg.mass || 50, 10000));
+      const spawnId = `${isBot ? 'bot' : 'npc'}-${uid()}`;
       const color = pick(CLR), pos = rp();
-      players.set(botId, {
-        id: botId, name: botName, color, isBot: true, feedBonus: 0,
-        cells: [{ id: uid(), x: pos.x, y: pos.y, m: botMass, c: color }],
-        mx: pos.x, my: pos.y, lastPing: Date.now(), device: 'Bot',
-        dead: false, deathTime: 0, joinTime: Date.now(), peakMass: botMass, lastLaser: 0, lastSplitAt: 0, phaseOutUntil: 0,
-        bot: { tx: pos.x, ty: pos.y, rt: Date.now() + 1000, scd: Date.now() + 5000 },
-      });
-      ws.send(JSON.stringify({ t: 'am', ok: 1, action: 'admin_add_bot', botId }));
+      const spawned = {
+        id: spawnId, name: spawnName, color, isBot, feedBonus: 0,
+        cells: [{ id: uid(), x: pos.x, y: pos.y, m: spawnMass, c: color }],
+        mx: pos.x, my: pos.y, lastPing: Date.now(), device: isBot ? 'Bot' : 'Admin Spawn',
+        dead: false, deathTime: 0, joinTime: Date.now(), peakMass: spawnMass, lastLaser: 0, lastSplitAt: 0, phaseOutUntil: 0,
+      };
+      if (isBot) {
+        spawned.bot = { tx: pos.x, ty: pos.y, rt: Date.now() + 1000, scd: Date.now() + 5000 };
+      }
+      players.set(spawnId, spawned);
+      ws.send(JSON.stringify({ t: 'am', ok: 1, action: 'admin_add_bot', botId: spawnId, playerId: spawnId, playerType }));
       break;
     }
     // ---- Admin Rename ----
@@ -899,7 +938,7 @@ function handleMessage(ws, conn, msg) {
       if (!conn.isAdmin) return;
       const allowed = ['splitSpeed','splitDecel','wallKill','mergeDelay','decayRate','decayMin',
         'virusCount','virusMass','ejectMass','ejectSpeed','ejectLoss',
-        'gameMode','laserCooldown','laserDamage','laserRange','bgMusic',
+        'gameMode','laserCooldown','laserDamage','laserRange','laserLength','laserWidth','laserCellKill','bgMusic',
         'movementStyle','mobileControlMode',
         'azozMapRatio','azozMaxFoodMass','azozMushroomThreshold','azozMushroomFlash',
         'azozMushroomLifetime','azozMushroomName','redMushroom',
@@ -919,6 +958,24 @@ function handleMessage(ws, conn, msg) {
         if (k === 'bgMusic') {
           const v = Math.floor(Number(msg[k]));
           if (Number.isFinite(v)) gameConfig.bgMusic = clp(v, BG_MUSIC_RANDOM, MUSIC_TRACK_COUNT - 1);
+          continue;
+        }
+        if (k === 'laserRange' || k === 'laserLength') {
+          const v = Number(msg[k]);
+          if (Number.isFinite(v)) {
+            const len = clp(v, 50, 5000);
+            gameConfig.laserRange = len;
+            gameConfig.laserLength = len;
+          }
+          continue;
+        }
+        if (k === 'laserWidth') {
+          const v = Number(msg[k]);
+          if (Number.isFinite(v)) gameConfig.laserWidth = clp(v, 1, 200);
+          continue;
+        }
+        if (k === 'laserCellKill') {
+          gameConfig.laserCellKill = !!msg[k];
           continue;
         }
         if (k === 'movementStyle') {
