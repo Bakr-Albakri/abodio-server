@@ -307,7 +307,7 @@ const sgConfig = {
   chestRefillSec: 75,
   weaponMaxTier: 4,
   armorMaxTier: 3,
-  lateJoinAsSpectator: true,
+  lateJoinAsSpectator: false,
   autoResetSec: 12,
 };
 
@@ -1408,7 +1408,8 @@ function sgJoin(ws, conn, msg) {
     device: parseDevice(msg.ua || 'Unknown'),
   };
 
-  if (sgMatch.phase === 'running' && sgConfig.lateJoinAsSpectator) sgSetSpectator(p);
+  const aliveNow = sgAlivePlayers().length;
+  if (sgMatch.phase === 'running' && sgConfig.lateJoinAsSpectator && aliveNow >= 2) sgSetSpectator(p);
   else sgResetPlayerForRound(p);
 
   sgPlayers.set(id, p);
