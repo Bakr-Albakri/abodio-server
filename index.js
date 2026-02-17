@@ -2149,17 +2149,12 @@ function mkSgLb() {
 }
 
 function broadcastSurvival(data) {
-        for (const [ws, conn] of connections) {
-          if (conn.playerId === p.id && ws.readyState === 1) {
-            safeSend(ws, JSON.stringify({
-              t: 'death',
-              peak: p.peakMass || SM,
-              timeAlive: Math.floor((Date.now() - (p.joinTime || Date.now())) / 1000),
-              message: gameConfig.endGameMessage || 'You Got Eaten!'
-            }));
-          }
-        }
-      }
+  for (const [ws, conn] of connections) {
+    if (conn.sgPlayerId && ws.readyState === 1) {
+      safeSend(ws, data);
+    }
+  }
+}
 function sendSurvivalAdminState(ws) {
   const players = [];
   for (const p of sgPlayers.values()) {
