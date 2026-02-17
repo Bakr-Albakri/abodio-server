@@ -3541,6 +3541,7 @@ setInterval(() => {
     broadcastState();
     broadcastSurvivalState();
     tkBroadcastState();
+    tkFlushLobby();
     broadcastAdminState();
   }
 }, Math.round(1000 / TICK_RATE));
@@ -4322,7 +4323,13 @@ function tkBroadcastAll(raw) {
   }
 }
 
+let tkLobbyDirty = false;
 function tkBroadcastLobby() {
+  tkLobbyDirty = true;
+}
+function tkFlushLobby() {
+  if (!tkLobbyDirty) return;
+  tkLobbyDirty = false;
   const players = [...tkPlayers.values()].filter(p => !p.spectator).map(p => ({
     id: p.id, name: p.name, team: p.team, isBot: p.isBot, ready: false,
   }));
