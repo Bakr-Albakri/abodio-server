@@ -1,0 +1,241 @@
+{
+  "version": 1,
+  "id": "classic-iron-cross",
+  "name": "Classic Iron Cross",
+  "description": "Vast battlefield with twin rivers, dense forests, and fortified eagle strongholds at opposite ends",
+  "width": 56,
+  "height": 56,
+  "tileSize": 32,
+  "rows": [
+    "SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS",
+    "S......................................................S",
+    "S................BWWB.....SSSS.....BWWB................S",
+    "S................BWWB.TTTTTTTTTTTT.BWWB................S",
+    "S................BWWB.TTTTTTTTTTTT.BWWB................S",
+    "S......TTTTTTTT..BWWB.TTTTTTTTTTTT.BWWB..TTTTTTTT......S",
+    "S......TTTTTTTT..BWWB.TTTTTTTTTTTT.BWWB..TTTTTTTT......S",
+    "S......TTTTTTTT..BWWB.TTTTTTTTTTTT.BWWB..TTTTTTTT......S",
+    "S......TTTTTTTT..BWWB.TTTTTTTTTTTT.BWWB..TTTTTTTT......S",
+    "S......TTTTTTTT..BWWB.TTTTTTTTTTTT.BWWB..TTTTTTTT......S",
+    "S...............SBWWBS............SBWWBS...............S",
+    "S...............S....S............S....S...............S",
+    "S....BB.........S.II.S............S.II.S.........BB....S",
+    "S....BB.........S.II.S............S.II.S.........BB....S",
+    "S...........BB..S....S............S....S..BB...........S",
+    "S...........BB..SBWWBS............SBWWBS..BB...........S",
+    "S................BWWB..............BWWB................S",
+    "S................BWWB..............BWWB................S",
+    "S................BWWB..TTTT..TTTT..BWWB................S",
+    "S..BBBB..........BWWB..TTTT..TTTT..BWWB..........BBBB..S",
+    "S.........TTTTTT.BWWB..TTTT..TTTT..BWWB.TTTTTT.........S",
+    "S.........TTTTTT.BWWB..TTTT..TTTT..BWWB.TTTTTT.........S",
+    "S.......B.TTTTTT.BWWB..TTTT..TTTT..BWWB.TTTTTT.B.......S",
+    "S.......B.TTTTTT.BWWB..TTTT..TTTT..BWWB.TTTTTT.B.......S",
+    "S.......B.TTTTTT.BWWB..............BWWB.TTTTTT.B.......S",
+    "S...S...B.......SBWWBS....BBBB....SBWWBS.......B...S...S",
+    "S...S...B..WW...S....S..BB.SS.BB..S....S...WW..B...S...S",
+    "S...S......WW.BBS.II.S..BBSSSSBB..S.II.SBB.WW......S...S",
+    "S...S......WW.BBS.II.S..BBSSSSBB..S.II.SBB.WW......S...S",
+    "S...S...B..WW...S....S..BB.SS.BB..S....S...WW..B...S...S",
+    "S...S...B.......SBWWBS....BBBB....SBWWBS.......B...S...S",
+    "S.......B.TTTTTT.BWWB..............BWWB.TTTTTT.B.......S",
+    "S.......B.TTTTTT.BWWB..TTTT..TTTT..BWWB.TTTTTT.B.......S",
+    "S.......B.TTTTTT.BWWB..TTTT..TTTT..BWWB.TTTTTT.B.......S",
+    "S.........TTTTTT.BWWB..TTTT..TTTT..BWWB.TTTTTT.........S",
+    "S.........TTTTTT.BWWB..TTTT..TTTT..BWWB.TTTTTT.........S",
+    "S..BBBB..........BWWB..TTTT..TTTT..BWWB..........BBBB..S",
+    "S................BWWB..TTTT..TTTT..BWWB................S",
+    "S................BWWB..............BWWB................S",
+    "S................BWWB..............BWWB................S",
+    "S...........BB..SBWWBS............SBWWBS..BB...........S",
+    "S...........BB..S....S............S....S..BB...........S",
+    "S....BB.........S.II.S............S.II.S.........BB....S",
+    "S....BB.........S.II.S............S.II.S.........BB....S",
+    "S...............S....S............S....S...............S",
+    "S...............SBWWBS............SBWWBS...............S",
+    "S......TTTTTTTT..BWWB.TTTTTTTTTTTT.BWWB..TTTTTTTT......S",
+    "S......TTTTTTTT..BWWB.TTTTTTTTTTTT.BWWB..TTTTTTTT......S",
+    "S......TTTTTTTT..BWWB.TTTTTTTTTTTT.BWWB..TTTTTTTT......S",
+    "S......TTTTTTTT..BWWB.TTTTTTTTTTTT.BWWB..TTTTTTTT......S",
+    "S......TTTTTTTT..BWWB.TTTTTTTTTTTT.BWWB..TTTTTTTT......S",
+    "S................BWWB.TTTTTTTTTTTT.BWWB................S",
+    "S................BWWB.TTTTTTTTTTTT.BWWB................S",
+    "S................BWWB.....SSSS.....BWWB................S",
+    "S......................................................S",
+    "SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS"
+  ],
+  "spawns": [
+    {
+      "id": "p1",
+      "x": 4.5,
+      "y": 13.5,
+      "team": "red",
+      "headingDeg": 0
+    },
+    {
+      "id": "p2",
+      "x": 51.5,
+      "y": 13.5,
+      "team": "blue",
+      "headingDeg": 180
+    },
+    {
+      "id": "p3",
+      "x": 4.5,
+      "y": 41.5,
+      "team": "red",
+      "headingDeg": 0
+    },
+    {
+      "id": "p4",
+      "x": 51.5,
+      "y": 41.5,
+      "team": "blue",
+      "headingDeg": 180
+    }
+  ],
+  "compatibleModes": [
+    "default",
+    "hide-seek",
+    "capture-flag",
+    "king-of-core",
+    "hot-potato",
+    "last-stand"
+  ],
+  "objectives": [
+    {
+      "id": "core",
+      "type": "hill",
+      "x": 28,
+      "y": 28
+    }
+  ],
+  "hazards": [
+    {
+      "id": "storm-core",
+      "type": "storm",
+      "x": 28,
+      "y": 28,
+      "radiusTiles": 4.5,
+      "strength": 0.35
+    },
+    {
+      "id": "mine-bridge-tl",
+      "type": "minefield",
+      "x": 19,
+      "y": 12.5,
+      "radiusTiles": 1.8,
+      "strength": 0.8
+    },
+    {
+      "id": "mine-bridge-tr",
+      "type": "minefield",
+      "x": 37,
+      "y": 12.5,
+      "radiusTiles": 1.8,
+      "strength": 0.8
+    },
+    {
+      "id": "mine-bridge-bl",
+      "type": "minefield",
+      "x": 19,
+      "y": 42.5,
+      "radiusTiles": 1.8,
+      "strength": 0.8
+    },
+    {
+      "id": "mine-bridge-br",
+      "type": "minefield",
+      "x": 37,
+      "y": 42.5,
+      "radiusTiles": 1.8,
+      "strength": 0.8
+    }
+  ],
+  "theme": {
+    "floorColor": "#1a2e1f",
+    "accentColor": "#6b9a5c",
+    "fogColor": "#0d150f",
+    "skyColor": "#15241a"
+  },
+  "elevation": {
+    "base": 0,
+    "zones": [
+      {
+        "id": "center-plateau",
+        "shape": "circle",
+        "x": 28,
+        "y": 28,
+        "radius": 5.5,
+        "falloff": 3,
+        "amount": 0.72
+      },
+      {
+        "id": "north-ridge",
+        "shape": "rect",
+        "x": 28,
+        "y": 8,
+        "width": 14,
+        "depth": 4,
+        "falloff": 2.2,
+        "amount": 0.38
+      },
+      {
+        "id": "south-ridge",
+        "shape": "rect",
+        "x": 28,
+        "y": 48,
+        "width": 14,
+        "depth": 4,
+        "falloff": 2.2,
+        "amount": 0.38
+      },
+      {
+        "id": "left-river-valley",
+        "shape": "rect",
+        "x": 18.5,
+        "y": 28,
+        "width": 3.5,
+        "depth": 40,
+        "falloff": 1.5,
+        "amount": -0.35
+      },
+      {
+        "id": "right-river-valley",
+        "shape": "rect",
+        "x": 36.5,
+        "y": 28,
+        "width": 3.5,
+        "depth": 40,
+        "falloff": 1.5,
+        "amount": -0.35
+      },
+      {
+        "id": "left-eagle-hill",
+        "shape": "circle",
+        "x": 6,
+        "y": 28,
+        "radius": 4.5,
+        "falloff": 3,
+        "amount": 0.48
+      },
+      {
+        "id": "right-eagle-hill",
+        "shape": "circle",
+        "x": 50,
+        "y": 28,
+        "radius": 4.5,
+        "falloff": 3,
+        "amount": 0.48
+      }
+    ]
+  },
+  "tags": [
+    "large",
+    "rivers",
+    "bridges",
+    "forests",
+    "team-objective",
+    "eagle-guards"
+  ]
+}

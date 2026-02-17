@@ -2594,7 +2594,7 @@ const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws, req) => {
   const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').toString().split(',')[0].trim();
-  const conn = { playerId: null, sgPlayerId: null, isAdmin: false, adminGame: 'agar', ip };
+  const conn = { playerId: null, sgPlayerId: null, tkPlayerId: null, isAdmin: false, adminGame: 'agar', ip };
   connections.set(ws, conn);
 
   ws.on('message', (raw) => {
@@ -2613,6 +2613,9 @@ wss.on('connection', (ws, req) => {
       if (sp) sgLog('leave', `${sp.name} left`);
       sgPlayers.delete(conn.sgPlayerId);
       conn.sgPlayerId = null;
+    }
+    if (conn.tkPlayerId) {
+      tkLeave(conn);
     }
     connections.delete(ws);
   });
@@ -3501,6 +3504,16 @@ function handleMessage(ws, conn, msg) {
       }
       break;
     }
+    // ---- Tank 1990 ----
+    case 'join-lobby': { tkJoin(ws, conn, msg); break; }
+    case 'team-select': { tkHandleTeam(conn, msg); break; }
+    case 'ready': { tkHandleReady(conn, msg); break; }
+    case 'input': { tkHandleInput(conn, msg); break; }
+    case 'tkl': { tkLeave(conn); break; }
+    case 'ping': {
+      if (msg.v === 1) safeSend(ws, JSON.stringify({ v: 1, t: 'pong', sentAt: msg.sentAt, serverAt: Date.now() }));
+      break;
+    }
   }
 }
 
@@ -3519,6 +3532,7 @@ setInterval(() => {
   const t0 = performance.now();
   tick();
   sgTick();
+  tkTick();
   const tickMs = performance.now() - t0;
   dbg.tickMs = tickMs;
   dbg.tickCount++;
@@ -3531,6 +3545,7 @@ setInterval(() => {
   if (tickCount % Math.round(TICK_RATE / BROADCAST_RATE) === 0) {
     broadcastState();
     broadcastSurvivalState();
+    tkBroadcastState();
     broadcastAdminState();
   }
 }, Math.round(1000 / TICK_RATE));
@@ -3613,6 +3628,808 @@ function broadcastAdminState() {
       } catch (_) { /* ignore */ }
     }
   }
+}
+
+// ============================================================================
+// TANK 1990 — Online Multiplayer
+// ============================================================================
+const TK_PROTOCOL = 1;
+const TK_TANK_RADIUS = 0.34;
+const TK_BULLET_RADIUS = 0.12;
+const TK_BULLET_LIFETIME = 2.8;
+const TK_TANK_HP = 100;
+const TK_DEFAULT_LIVES = 3;
+const TK_BASE_DMG = 18;
+const TK_DMG_VARIANCE = 0.25;
+const TK_CRIT_CHANCE = 0.15;
+const TK_CRIT_MUL = 2.2;
+const TK_CLOSE_RANGE_DIST = 4;
+const TK_CLOSE_RANGE_MUL = 1.35;
+const TK_MOVE_SPEED = 9;
+const TK_MOVE_SCALE = 0.62;
+const TK_TURN_DEG = 360;
+const TK_TURN_SCALE = 0.6;
+const TK_ALIGN_TOL = 0.18;
+const TK_BULLET_SPEED = 15;
+const TK_BULLET_SCALE = 0.88;
+const TK_BULLET_CD = 520;
+const TK_MAX_BULLETS = 1;
+const TK_RESPAWN_SEC = 2;
+const TK_SPAWN_PROT_SEC = 2;
+const TK_EAGLE_HP = 12;
+const TK_EAGLE_HIT_R = 1.28;
+const TK_EAGLE_COL_R = 1.45;
+const TK_BOT_THINK_MIN = 220;
+const TK_BOT_THINK_MAX = 460;
+const TK_MATCH_SEC = 300;
+const TK_MAX_DT = 0.05;
+const TK_AUTO_RESET_MS = 8000;
+const TK_COUNTDOWN_MS = 3000;
+const TK_FORT_RINGS = 3;
+const TK_FORT_DENSITY = 1.25;
+const TK_FORT_STEEL = 0.32;
+
+const TK_TILE = {
+  '.': { bt: false, bb: false, dest: false, ice: false, water: false },
+  B:   { bt: true,  bb: true,  dest: true,  ice: false, water: false },
+  S:   { bt: true,  bb: true,  dest: false, ice: false, water: false },
+  W:   { bt: false, bb: false, dest: false, ice: false, water: true  },
+  T:   { bt: false, bb: false, dest: false, ice: false, water: false },
+  I:   { bt: false, bb: false, dest: false, ice: true,  water: false },
+};
+
+const tkMapSrc = require('./tank-maps/classic-iron-cross.json');
+const tkPlayers = new Map();
+let tkBullets = [];
+let tkEagles = [];
+let tkTiles = [];
+let tkTileChanges = [];
+let tkPendingEvents = [];
+let tkLastTick = Date.now();
+let tkTickN = 0;
+let tkNextBulletId = 1;
+const tkBotNames = ['Bolt', 'Rivet', 'Cannon', 'Razor', 'Viper', 'Titan'];
+
+const tkMatch = {
+  phase: 'lobby', hostId: null, countdownAt: 0, startedAt: 0, elapsed: 0,
+  endedAt: 0, winnerId: null, winnerTeam: null, endReason: '',
+};
+
+// -- Helpers --
+function tkClp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+function tkDSq(ax, ay, bx, by) { const dx = bx - ax, dy = by - ay; return dx * dx + dy * dy; }
+function tkDamp(cur, tgt, lam, dt) { return cur + (tgt - cur) * (1 - Math.exp(-lam * dt)); }
+function tkAngLerp(from, to, maxD) {
+  let d = Math.atan2(Math.sin(to - from), Math.cos(to - from));
+  d = tkClp(d, -maxD, maxD);
+  return from + d;
+}
+function tkAngDiff(a, b) { return Math.abs(Math.atan2(Math.sin(a - b), Math.cos(a - b))); }
+function tkHash2(x, y) { const v = Math.sin(x * 127.1 + y * 311.7) * 43758.5453123; return v - Math.floor(v); }
+function tkCIR(cx, cy, r, rx, ry, rw, rh) {
+  const nx = tkClp(cx, rx, rx + rw), ny = tkClp(cy, ry, ry + rh);
+  const dx = cx - nx, dy = cy - ny;
+  return dx * dx + dy * dy <= r * r;
+}
+function tkUid() { return `tk${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`; }
+
+function tkGetTile(x, y) {
+  if (y < 0 || y >= tkTiles.length || x < 0 || x >= (tkTiles[0] || []).length) return null;
+  return tkTiles[y][x];
+}
+function tkSetTile(x, y, code) {
+  if (y < 0 || y >= tkTiles.length || x < 0 || x >= (tkTiles[0] || []).length) return;
+  tkTiles[y][x] = code;
+  tkTileChanges.push({ x, y, c: code });
+}
+
+function tkCountBricks() {
+  let n = 0;
+  for (const row of tkTiles) for (const c of row) if (c === 'B') n++;
+  return n;
+}
+
+// -- Collision --
+function tkBlocked(tank, x, y) {
+  const R = TK_TANK_RADIUS, W = tkMapSrc.width, H = tkMapSrc.height;
+  if (x - R < 0 || x + R > W || y - R < 0 || y + R > H) return true;
+  const mnX = Math.floor(x - R), mxX = Math.floor(x + R);
+  const mnY = Math.floor(y - R), mxY = Math.floor(y + R);
+  for (let ty = mnY; ty <= mxY; ty++) for (let tx = mnX; tx <= mxX; tx++) {
+    const c = tkGetTile(tx, ty);
+    if (!c) return true;
+    if (TK_TILE[c] && TK_TILE[c].bt && tkCIR(x, y, R, tx, ty, 1, 1)) return true;
+  }
+  for (const e of tkEagles) {
+    if (!e.alive) continue;
+    if (tkDSq(x, y, e.x, e.y) < (R + TK_EAGLE_COL_R) ** 2) return true;
+  }
+  for (const [, o] of tkPlayers) {
+    if (!o.alive || o.id === tank.id || o.spectator) continue;
+    if (tkDSq(x, y, o.x, o.y) < (R * 2) ** 2 * 0.82) return true;
+  }
+  return false;
+}
+
+function tkTryMove(tank, dx, dy) {
+  if (Math.abs(dx) < 1e-4 && Math.abs(dy) < 1e-4) return true;
+  const tx = tank.x + dx, ty = tank.y + dy;
+  if (tkBlocked(tank, tx, ty)) return false;
+  tank.x = tkClp(tx, TK_TANK_RADIUS, tkMapSrc.width - TK_TANK_RADIUS);
+  tank.y = tkClp(ty, TK_TANK_RADIUS, tkMapSrc.height - TK_TANK_RADIUS);
+  return true;
+}
+
+function tkAlignLane(tank, ax, ay, dt) {
+  if (ax !== 0 && ay === 0) {
+    const lane = Math.round(tank.y - 0.5) + 0.5;
+    const ny = tkDamp(tank.y, lane, 24, dt);
+    if (!tkBlocked(tank, tank.x, ny)) tank.y = ny;
+  } else if (ay !== 0 && ax === 0) {
+    const lane = Math.round(tank.x - 0.5) + 0.5;
+    const nx = tkDamp(tank.x, lane, 24, dt);
+    if (!tkBlocked(tank, nx, tank.y)) tank.x = nx;
+  }
+}
+
+// -- Tank Step --
+function tkStepTank(tank, now, dt) {
+  const inp = tank.input;
+  let ax = 0, ay = 0;
+  if (inp.left) ax -= 1; if (inp.right) ax += 1;
+  if (inp.up) ay -= 1; if (inp.down) ay += 1;
+  const wants = ax !== 0 || ay !== 0;
+  if (Math.abs(ax) > Math.abs(ay)) ay = 0; else if (Math.abs(ay) > Math.abs(ax)) ax = 0;
+  const desired = wants ? Math.atan2(ay, ax) : tank.dir;
+  if (wants) tkAlignLane(tank, ax, ay, dt);
+  const turnRad = (TK_TURN_DEG * TK_TURN_SCALE * Math.PI) / 180;
+  if (wants) tank.dir = tkAngLerp(tank.dir, desired, turnRad * dt);
+  if (wants && tkAngDiff(tank.dir, desired) < 0.02) tank.dir = desired;
+
+  const tx = Math.floor(tank.x), ty = Math.floor(tank.y);
+  const tc = tkGetTile(tx, ty);
+  const meta = tc ? TK_TILE[tc] : null;
+  const onIce = meta ? meta.ice : false;
+  const onWater = meta ? meta.water : false;
+  const wPen = onWater ? 0.38 : 1;
+  const spd = TK_MOVE_SPEED * TK_MOVE_SCALE * wPen * (onIce ? 1.12 : 1);
+  const canGo = wants && tkAngDiff(tank.dir, desired) <= TK_ALIGN_TOL;
+
+  if (canGo) {
+    if (onIce) {
+      tank.vx = tkDamp(tank.vx, Math.cos(tank.dir) * spd, 8.2, dt);
+      tank.vy = tkDamp(tank.vy, Math.sin(tank.dir) * spd, 8.2, dt);
+    } else { tank.vx = Math.cos(tank.dir) * spd; tank.vy = Math.sin(tank.dir) * spd; }
+  } else {
+    if (onIce) { tank.vx = tkDamp(tank.vx, 0, 2.8, dt); tank.vy = tkDamp(tank.vy, 0, 2.8, dt); }
+    else { tank.vx = 0; tank.vy = 0; }
+  }
+  if (!tkTryMove(tank, tank.vx * dt, 0)) tank.vx *= 0.2;
+  if (!tkTryMove(tank, 0, tank.vy * dt)) tank.vy *= 0.2;
+}
+
+// -- Bullets --
+function tkTryFire(tank, now) {
+  if (!tank.alive || now < tank.fireCD) return;
+  const inFlight = tkBullets.filter(b => b.ownerId === tank.id && b.life > 0).length;
+  if (inFlight >= TK_MAX_BULLETS) return;
+  const sx = tank.x + Math.cos(tank.dir) * (TK_TANK_RADIUS + 0.22);
+  const sy = tank.y + Math.sin(tank.dir) * (TK_TANK_RADIUS + 0.22);
+  tkBullets.push({
+    id: `b${tkNextBulletId++}`, ownerId: tank.id,
+    x: sx, y: sy, dx: Math.cos(tank.dir), dy: Math.sin(tank.dir),
+    speed: TK_BULLET_SPEED * TK_BULLET_SCALE, life: TK_BULLET_LIFETIME, ric: 0,
+  });
+  tank.fireCD = now + TK_BULLET_CD;
+  tkPendingEvents.push({ t: 'fire', id: tank.id, x: sx, y: sy, dir: tank.dir });
+}
+
+function tkBulletHitTile(b, px, py) {
+  const tx = Math.floor(b.x), ty = Math.floor(b.y);
+  const c = tkGetTile(tx, ty);
+  if (!c) { b.life = -1; return true; }
+  const m = TK_TILE[c];
+  if (!m || !m.bb) return false;
+  if (m.dest) {
+    tkSetTile(tx, ty, '.');
+    b.life = -1;
+    const owner = tkPlayers.get(b.ownerId);
+    if (owner) owner.score += 0.2;
+    tkPendingEvents.push({ t: 'brick', x: tx + 0.5, y: ty + 0.5 });
+    return true;
+  }
+  if (b.ric > 0) {
+    b.ric--;
+    const ptx = Math.floor(px), pty = Math.floor(py);
+    const cx = ptx !== tx, cy = pty !== ty;
+    if (cx) b.dx *= -1; if (cy) b.dy *= -1;
+    if (!cx && !cy) { if (Math.abs(b.dx) > Math.abs(b.dy)) b.dx *= -1; else b.dy *= -1; }
+    return true;
+  }
+  b.life = -1; return true;
+}
+
+function tkBulletHitTank(b, now) {
+  const owner = tkPlayers.get(b.ownerId);
+  for (const [, tank] of tkPlayers) {
+    if (!tank.alive || tank.id === b.ownerId || tank.spectator) continue;
+    if (owner && owner.team !== 'none' && tank.team === owner.team) continue;
+    if (now < tank.spawnProt) continue;
+    if (tkDSq(tank.x, tank.y, b.x, b.y) > (TK_TANK_RADIUS + TK_BULLET_RADIUS) ** 2) continue;
+    b.life = -1;
+    const variance = 1 + (Math.random() * 2 - 1) * TK_DMG_VARIANCE;
+    const isCrit = Math.random() < TK_CRIT_CHANCE;
+    const critM = isCrit ? TK_CRIT_MUL : 1;
+    const dist = owner ? Math.sqrt(tkDSq(owner.x, owner.y, tank.x, tank.y)) : 999;
+    const rangeM = dist < TK_CLOSE_RANGE_DIST ? TK_CLOSE_RANGE_MUL : 1;
+    const dmg = Math.round(tkClp(TK_BASE_DMG * variance * critM * rangeM, 1, 100));
+    tank.hp -= dmg;
+    tkPendingEvents.push({ t: 'hit', x: b.x, y: b.y, dmg, crit: isCrit, tid: tank.id, oid: b.ownerId });
+    if (tank.hp <= 0) {
+      tank.hp = 0; tank.lives--; tank.alive = false;
+      tank.respawnAt = now + TK_RESPAWN_SEC * 1000;
+      if (owner) owner.score += 1;
+      if (tank.lives <= 0) tank.spawnProt = 0;
+      tkPendingEvents.push({ t: 'kill', x: tank.x, y: tank.y, tid: tank.id, oid: b.ownerId, color: tank.color });
+    }
+    return true;
+  }
+  return false;
+}
+
+function tkBulletHitEagle(b, now) {
+  const owner = tkPlayers.get(b.ownerId);
+  if (!owner || owner.team === 'none') return false;
+  for (const e of tkEagles) {
+    if (!e.alive || e.team === owner.team) continue;
+    if (tkDSq(e.x, e.y, b.x, b.y) > (TK_EAGLE_HIT_R + TK_BULLET_RADIUS) ** 2) continue;
+    b.life = -1;
+    e.hp = Math.max(0, e.hp - 1);
+    tkPendingEvents.push({ t: 'eagle-hit', x: b.x, y: b.y, eid: e.id, ehp: e.hp });
+    if (e.hp <= 0) {
+      e.alive = false; owner.score += 6;
+      tkPendingEvents.push({ t: 'eagle-kill', x: e.x, y: e.y, eid: e.id, team: e.team });
+    } else { owner.score += 0.4; }
+    return true;
+  }
+  return false;
+}
+
+function tkStepBullets(now, dt) {
+  const W = tkMapSrc.width, H = tkMapSrc.height;
+  for (const b of tkBullets) {
+    if (b.life <= 0) continue;
+    let rem = b.speed * dt;
+    while (rem > 0 && b.life > 0) {
+      const seg = Math.min(0.18, rem);
+      const px = b.x, py = b.y;
+      b.x += b.dx * seg; b.y += b.dy * seg;
+      b.life -= seg / b.speed; rem -= seg;
+      if (b.x < 0 || b.x > W || b.y < 0 || b.y > H) { b.life = -1; break; }
+      if (tkBulletHitTile(b, px, py)) break;
+      if (tkBulletHitTank(b, now)) break;
+      if (tkBulletHitEagle(b, now)) break;
+    }
+  }
+}
+
+function tkResolveBvB() {
+  for (let i = 0; i < tkBullets.length; i++) {
+    const a = tkBullets[i]; if (a.life <= 0) continue;
+    for (let j = i + 1; j < tkBullets.length; j++) {
+      const b = tkBullets[j]; if (b.life <= 0 || a.ownerId === b.ownerId) continue;
+      if (tkDSq(a.x, a.y, b.x, b.y) <= (TK_BULLET_RADIUS * 2.3) ** 2) {
+        tkPendingEvents.push({ t: 'impact', x: (a.x + b.x) * 0.5, y: (a.y + b.y) * 0.5 });
+        a.life = -1; b.life = -1; break;
+      }
+    }
+  }
+}
+
+function tkCleanBullets() {
+  tkBullets = tkBullets.filter(b => b.life > 0);
+}
+
+// -- Bot AI --
+function tkPickTarget(bot) {
+  let best = null, bestD = Infinity;
+  for (const [, p] of tkPlayers) {
+    if (!p.alive || p.id === bot.id || p.spectator) continue;
+    if (bot.team !== 'none' && p.team === bot.team) continue;
+    const d = tkDSq(bot.x, bot.y, p.x, p.y);
+    if (d < bestD) { best = p; bestD = d; }
+  }
+  return best;
+}
+
+function tkEnemyEagle(team) {
+  return tkEagles.find(e => e.alive && e.team !== team) || null;
+}
+
+function tkLineOfFire(fx, fy, tx, ty) {
+  const dx = tx - fx, dy = ty - fy;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  if (dist < 0.1) return true;
+  const nx = dx / dist, ny = dy / dist;
+  const steps = Math.ceil(dist / 0.2);
+  let x = fx, y = fy;
+  for (let i = 0; i < steps; i++) {
+    x += nx * 0.2; y += ny * 0.2;
+    const c = tkGetTile(Math.floor(x), Math.floor(y));
+    if (!c) return false;
+    if (TK_TILE[c] && TK_TILE[c].bb) return false;
+  }
+  return true;
+}
+
+function tkBotAI(now) {
+  for (const [, p] of tkPlayers) {
+    if (!p.isBot || !p.alive || p.spectator) continue;
+    p.lastPing = now;
+    if (!p.bot) p.bot = { thinkAt: 0, mx: 0, my: 0, fireUntil: 0 };
+    if (now >= p.bot.thinkAt) {
+      p.bot.thinkAt = now + TK_BOT_THINK_MIN + Math.random() * (TK_BOT_THINK_MAX - TK_BOT_THINK_MIN);
+      const tgt = tkPickTarget(p);
+      const eagle = tkEnemyEagle(p.team);
+      const tgtX = tgt ? tgt.x : eagle ? eagle.x : undefined;
+      const tgtY = tgt ? tgt.y : eagle ? eagle.y : undefined;
+      if (tgtX === undefined) { p.bot.mx = 0; p.bot.my = 0; p.bot.fireUntil = 0; }
+      else {
+        const dx = tgtX - p.x, dy = tgtY - p.y;
+        if (Math.abs(dx) > Math.abs(dy)) { p.bot.mx = Math.sign(dx); p.bot.my = 0; }
+        else { p.bot.mx = 0; p.bot.my = Math.sign(dy); }
+        const aligned = Math.abs(dx) < 0.42 || Math.abs(dy) < 0.42;
+        const lof = aligned && (tgt ? tkLineOfFire(p.x, p.y, tgt.x, tgt.y) : eagle ? tkLineOfFire(p.x, p.y, eagle.x, eagle.y) : false);
+        p.bot.fireUntil = lof ? now + 140 : 0;
+      }
+      if (Math.random() < 0.08) {
+        if (Math.random() < 0.5) { p.bot.mx = Math.random() < 0.5 ? -1 : 1; p.bot.my = 0; }
+        else { p.bot.mx = 0; p.bot.my = Math.random() < 0.5 ? -1 : 1; }
+      }
+    }
+    p.input = { up: p.bot.my < 0, down: p.bot.my > 0, left: p.bot.mx < 0, right: p.bot.mx > 0, fire: now < p.bot.fireUntil };
+  }
+}
+
+// -- Respawn --
+function tkRespawn(tank, now) {
+  if (tank.alive || tank.lives <= 0 || now < tank.respawnAt) return;
+  const spawns = tkMapSrc.spawns.filter(s =>
+    tank.team === 'red' ? s.x <= tkMapSrc.width / 2 : s.x >= tkMapSrc.width / 2
+  );
+  const pool = spawns.length > 0 ? spawns : tkMapSrc.spawns;
+  for (let i = 0; i < pool.length; i++) {
+    const s = pool[(Math.floor(Math.random() * pool.length) + i) % pool.length];
+    if (!tkBlocked(tank, s.x, s.y)) {
+      tank.x = s.x; tank.y = s.y;
+      tank.dir = ((s.headingDeg || 0) * Math.PI) / 180;
+      tank.hp = TK_TANK_HP; tank.alive = true;
+      tank.spawnProt = now + TK_SPAWN_PROT_SEC * 1000;
+      tank.vx = 0; tank.vy = 0; tank.fireCD = 0;
+      return;
+    }
+  }
+}
+
+// -- Eagle Fortress --
+function tkGetAnchors() {
+  const margin = tkClp(4.4 + TK_FORT_RINGS * 0.9, 3.8, tkMapSrc.width * 0.38);
+  return { lx: margin, rx: tkMapSrc.width - margin, y: tkMapSrc.height * 0.5 };
+}
+
+function tkBuildFort() {
+  const { lx, rx, y } = tkGetAnchors();
+  const specs = [{ team: 'red', x: lx, y }, { team: 'blue', x: rx, y }];
+  const rings = TK_FORT_RINGS, dens = TK_FORT_DENSITY, steel = TK_FORT_STEEL;
+  const gateH = Math.max(1, Math.round(0.7 + dens * 0.7));
+  for (const sp of specs) {
+    const cx = Math.floor(sp.x), cy = Math.floor(sp.y);
+    for (let r = 1; r <= rings + 1; r++) {
+      const span = 2 + r;
+      for (let ty = cy - span; ty <= cy + span; ty++) for (let tx = cx - span; tx <= cx + span; tx++) {
+        if (tx <= 0 || ty <= 0 || tx >= tkMapSrc.width - 1 || ty >= tkMapSrc.height - 1) continue;
+        if (Math.abs(tx - cx) !== span && Math.abs(ty - cy) !== span) continue;
+        const gateFace = sp.team === 'red' ? tx === cx + span : tx === cx - span;
+        if (gateFace && Math.abs(ty - cy) <= gateH && r >= rings) { tkSetTile(tx, ty, '.'); continue; }
+        if (Math.abs(tx - cx) <= 1 && Math.abs(ty - cy) <= 1) continue;
+        const n = tkHash2(tx * 2.31 + r * 9.11 + (sp.team === 'red' ? 3.7 : 8.2), ty * 3.12 + r * 4.87);
+        if (n > tkClp(0.56 + dens * 0.27, 0.45, 0.96)) continue;
+        tkSetTile(tx, ty, n <= tkClp(steel + (r === rings + 1 ? 0.14 : 0), 0.05, 0.95) ? 'S' : 'B');
+      }
+    }
+    const rubble = Math.round(4 + dens * 5);
+    for (let i = 0; i < rubble; i++) {
+      const ox = Math.floor((tkHash2(i * 7.1 + cx, cy * 1.3 + i) - 0.5) * 5);
+      const oy = Math.floor((tkHash2(i * 9.7 + cy, cx * 1.9 + i) - 0.5) * 5);
+      const ttx = cx + ox, tty = cy + oy;
+      if (ttx <= 1 || tty <= 1 || ttx >= tkMapSrc.width - 1 || tty >= tkMapSrc.height - 1) continue;
+      if (Math.abs(ttx - cx) <= 1 && Math.abs(tty - cy) <= 1) continue;
+      if (tkGetTile(ttx, tty) === '.') tkSetTile(ttx, tty, 'B');
+    }
+  }
+}
+
+// -- Win Check --
+function tkTeamScore(team) {
+  let s = 0;
+  for (const [, p] of tkPlayers) if (p.team === team && !p.spectator) s += p.score;
+  return s;
+}
+function tkTeamLeader(team) {
+  let best = null, bs = -1;
+  for (const [, p] of tkPlayers) {
+    if (p.team !== team || p.spectator) continue;
+    if (p.score > bs || (p.score === bs && p.alive)) { best = p.id; bs = p.score; }
+  }
+  return best;
+}
+
+function tkCheckWin(now) {
+  if (tkMatch.phase !== 'running') return;
+  const re = tkEagles.find(e => e.team === 'red');
+  const be = tkEagles.find(e => e.team === 'blue');
+  if (re && be) {
+    if (!re.alive && be.alive) { tkEndMatch(tkTeamLeader('blue'), 'blue', 'eagle-destroyed'); return; }
+    if (!be.alive && re.alive) { tkEndMatch(tkTeamLeader('red'), 'red', 'eagle-destroyed'); return; }
+    if (!re.alive && !be.alive) {
+      const w = tkTeamScore('red') >= tkTeamScore('blue') ? 'red' : 'blue';
+      tkEndMatch(tkTeamLeader(w), w, 'both-eagles'); return;
+    }
+  }
+  if (tkMatch.elapsed >= TK_MATCH_SEC) {
+    const rh = re ? re.hp : 0, bh = be ? be.hp : 0;
+    let w;
+    if (rh !== bh) w = rh > bh ? 'red' : 'blue';
+    else w = tkTeamScore('red') >= tkTeamScore('blue') ? 'red' : 'blue';
+    tkEndMatch(tkTeamLeader(w), w, 'time'); return;
+  }
+  const rAlive = [...tkPlayers.values()].some(p => p.team === 'red' && !p.spectator && (p.alive || p.lives > 0));
+  const bAlive = [...tkPlayers.values()].some(p => p.team === 'blue' && !p.spectator && (p.alive || p.lives > 0));
+  if (!rAlive && bAlive) tkEndMatch(tkTeamLeader('blue'), 'blue', 'eliminated');
+  else if (rAlive && !bAlive) tkEndMatch(tkTeamLeader('red'), 'red', 'eliminated');
+}
+
+// -- Lobby & Match --
+function tkSpawnBot(name) {
+  const id = tkUid();
+  const redCount = [...tkPlayers.values()].filter(p => p.team === 'red' && !p.spectator).length;
+  const blueCount = [...tkPlayers.values()].filter(p => p.team === 'blue' && !p.spectator).length;
+  const team = redCount <= blueCount ? 'red' : 'blue';
+  const color = team === 'red' ? '#f87171' : '#60a5fa';
+  tkPlayers.set(id, {
+    id, name, team, color, isBot: true, spectator: false, ws: null,
+    x: 0, y: 0, dir: 0, hp: TK_TANK_HP, lives: TK_DEFAULT_LIVES, score: 0,
+    alive: false, respawnAt: 0, spawnProt: 0, fireCD: 0, vx: 0, vy: 0,
+    input: { up: false, down: false, left: false, right: false, fire: false },
+    lastSeq: 0, lastPing: Date.now(), bot: null,
+  });
+}
+
+function tkEnsureBots() {
+  if (tkMatch.phase !== 'lobby') return;
+  const humans = [...tkPlayers.values()].filter(p => !p.isBot && !p.spectator).length;
+  const bots = [...tkPlayers.values()].filter(p => p.isBot).length;
+  const desired = Math.max(0, 4 - humans);
+  if (bots < desired) {
+    for (let i = bots; i < desired; i++) tkSpawnBot(tkBotNames[i % tkBotNames.length]);
+  } else if (bots > desired) {
+    let rem = bots - desired;
+    for (const [id, p] of tkPlayers) {
+      if (rem <= 0) break;
+      if (p.isBot) { tkPlayers.delete(id); rem--; }
+    }
+  }
+  tkBalanceTeams();
+}
+
+function tkBalanceTeams() {
+  const players = [...tkPlayers.values()].filter(p => !p.spectator);
+  const red = players.filter(p => p.team === 'red');
+  const blue = players.filter(p => p.team === 'blue');
+  while (red.length > blue.length + 1) {
+    const bot = red.find(p => p.isBot) || red[red.length - 1];
+    bot.team = 'blue'; bot.color = bot.isBot ? '#60a5fa' : '#3b82f6';
+    red.splice(red.indexOf(bot), 1); blue.push(bot);
+  }
+  while (blue.length > red.length + 1) {
+    const bot = blue.find(p => p.isBot) || blue[blue.length - 1];
+    bot.team = 'red'; bot.color = bot.isBot ? '#f87171' : '#ef4444';
+    blue.splice(blue.indexOf(bot), 1); red.push(bot);
+  }
+}
+
+function tkSpawnPlayer(p) {
+  const spawns = tkMapSrc.spawns.filter(s =>
+    p.team === 'red' ? s.x <= tkMapSrc.width / 2 : s.x >= tkMapSrc.width / 2
+  );
+  const pool = spawns.length > 0 ? spawns : tkMapSrc.spawns;
+  const s = pool[Math.floor(Math.random() * pool.length)];
+  p.x = s.x; p.y = s.y;
+  p.dir = ((s.headingDeg || 0) * Math.PI) / 180;
+  p.hp = TK_TANK_HP; p.lives = TK_DEFAULT_LIVES; p.score = 0;
+  p.alive = true; p.spawnProt = Date.now() + TK_SPAWN_PROT_SEC * 1000;
+  p.vx = 0; p.vy = 0; p.fireCD = 0; p.respawnAt = 0;
+}
+
+function tkStartCountdown() {
+  if (tkMatch.phase !== 'lobby') return;
+  tkMatch.phase = 'countdown';
+  tkMatch.countdownAt = Date.now() + TK_COUNTDOWN_MS;
+  tkBroadcastLobby();
+}
+
+function tkStartMatch() {
+  tkMatch.phase = 'running';
+  tkMatch.startedAt = Date.now();
+  tkMatch.elapsed = 0;
+  tkMatch.winnerId = null; tkMatch.winnerTeam = null; tkMatch.endReason = '';
+  tkBullets = []; tkPendingEvents = []; tkTileChanges = []; tkNextBulletId = 1;
+  tkTiles = tkMapSrc.rows.map(r => r.split(''));
+  tkBuildFort();
+  const anch = tkGetAnchors();
+  tkEagles = [
+    { id: 'eagle-red', team: 'red', x: anch.lx, y: anch.y, hp: TK_EAGLE_HP, maxHp: TK_EAGLE_HP, alive: true },
+    { id: 'eagle-blue', team: 'blue', x: anch.rx, y: anch.y, hp: TK_EAGLE_HP, maxHp: TK_EAGLE_HP, alive: true },
+  ];
+  for (const [, p] of tkPlayers) {
+    if (p.spectator) continue;
+    tkSpawnPlayer(p);
+  }
+  // Send full initial state
+  const initMsg = JSON.stringify({
+    v: 1, t: 'match-start',
+    tiles: tkTiles.map(r => r.join('')),
+    eagles: tkEagles.map(e => ({ id: e.id, team: e.team, x: e.x, y: e.y, hp: e.hp, maxHp: e.maxHp })),
+    map: { id: tkMapSrc.id, width: tkMapSrc.width, height: tkMapSrc.height, tileSize: tkMapSrc.tileSize,
+           spawns: tkMapSrc.spawns, theme: tkMapSrc.theme, elevation: tkMapSrc.elevation,
+           objectives: tkMapSrc.objectives || [], hazards: tkMapSrc.hazards || [] },
+    players: [...tkPlayers.values()].filter(p => !p.spectator).map(p => ({
+      id: p.id, name: p.name, team: p.team, color: p.color, isBot: p.isBot,
+      x: p.x, y: p.y, dir: p.dir, hp: p.hp, lives: p.lives,
+    })),
+  });
+  for (const [, p] of tkPlayers) {
+    if (p.ws && p.ws.readyState === 1) safeSend(p.ws, initMsg);
+  }
+}
+
+function tkEndMatch(winnerId, winnerTeam, reason) {
+  if (tkMatch.phase !== 'running') return;
+  tkMatch.phase = 'ended'; tkMatch.endedAt = Date.now();
+  tkMatch.winnerId = winnerId; tkMatch.winnerTeam = winnerTeam; tkMatch.endReason = reason;
+  const winnerP = tkPlayers.get(winnerId);
+  tkBroadcastAll(JSON.stringify({
+    v: 1, t: 'match-ended', winnerId, winnerTeam, reason,
+    winnerName: winnerP ? winnerP.name : null,
+  }));
+}
+
+function tkResetLobby() {
+  tkMatch.phase = 'lobby'; tkMatch.hostId = null;
+  tkBullets = []; tkEagles = []; tkTileChanges = []; tkPendingEvents = [];
+  // Convert spectators to active, replace bots
+  for (const [, p] of tkPlayers) {
+    if (p.spectator && !p.isBot) {
+      p.spectator = false;
+      // Remove a bot to make room
+      for (const [bid, bp] of tkPlayers) {
+        if (bp.isBot) { tkPlayers.delete(bid); break; }
+      }
+    }
+    p.alive = false; p.score = 0; p.lives = TK_DEFAULT_LIVES; p.hp = TK_TANK_HP;
+  }
+  // Set host to first human
+  for (const [, p] of tkPlayers) {
+    if (!p.isBot && !p.spectator) { tkMatch.hostId = p.id; break; }
+  }
+  tkEnsureBots();
+  tkBroadcastLobby();
+}
+
+// -- Message Handlers --
+function tkJoin(ws, conn, msg) {
+  // Leave other games
+  if (conn.playerId) { players.delete(conn.playerId); conn.playerId = null; }
+  if (conn.sgPlayerId) { sgPlayers.delete(conn.sgPlayerId); conn.sgPlayerId = null; }
+
+  const name = String(msg.playerName || 'Tank').trim().slice(0, 20) || 'Tank';
+  const id = tkUid();
+  const isSpectator = tkMatch.phase === 'running' || tkMatch.phase === 'countdown';
+  const prefTeam = msg.preferredTeam === 'blue' ? 'blue' : 'red';
+  const redC = [...tkPlayers.values()].filter(p => p.team === 'red' && !p.spectator).length;
+  const blueC = [...tkPlayers.values()].filter(p => p.team === 'blue' && !p.spectator).length;
+  const team = isSpectator ? 'red' : (prefTeam === 'red' && redC <= blueC) || (prefTeam === 'blue' && blueC > redC) ? 'red'
+    : prefTeam === 'blue' ? 'blue' : redC <= blueC ? 'red' : 'blue';
+  const color = team === 'red' ? '#ef4444' : '#3b82f6';
+
+  const p = {
+    id, name, team, color, isBot: false, spectator: isSpectator, ws,
+    x: 0, y: 0, dir: 0, hp: TK_TANK_HP, lives: TK_DEFAULT_LIVES, score: 0,
+    alive: false, respawnAt: 0, spawnProt: 0, fireCD: 0, vx: 0, vy: 0,
+    input: { up: false, down: false, left: false, right: false, fire: false },
+    lastSeq: 0, lastPing: Date.now(), bot: null,
+  };
+  tkPlayers.set(id, p);
+  conn.tkPlayerId = id;
+
+  if (!isSpectator && !tkMatch.hostId) tkMatch.hostId = id;
+
+  safeSend(ws, JSON.stringify({
+    v: 1, t: 'welcome', sessionId: tkUid(), playerId: id,
+    isSpectator, hostId: tkMatch.hostId,
+  }));
+
+  if (isSpectator && tkMatch.phase === 'running') {
+    // Send match-start so they can render
+    safeSend(ws, JSON.stringify({
+      v: 1, t: 'match-start',
+      tiles: tkTiles.map(r => r.join('')),
+      eagles: tkEagles.map(e => ({ id: e.id, team: e.team, x: e.x, y: e.y, hp: e.hp, maxHp: e.maxHp })),
+      map: { id: tkMapSrc.id, width: tkMapSrc.width, height: tkMapSrc.height, tileSize: tkMapSrc.tileSize,
+             spawns: tkMapSrc.spawns, theme: tkMapSrc.theme, elevation: tkMapSrc.elevation,
+             objectives: tkMapSrc.objectives || [], hazards: tkMapSrc.hazards || [] },
+      players: [...tkPlayers.values()].filter(pp => !pp.spectator).map(pp => ({
+        id: pp.id, name: pp.name, team: pp.team, color: pp.color, isBot: pp.isBot,
+        x: pp.x, y: pp.y, dir: pp.dir, hp: pp.hp, lives: pp.lives,
+      })),
+    }));
+  }
+
+  if (!isSpectator) tkEnsureBots();
+  tkBroadcastLobby();
+}
+
+function tkLeave(conn) {
+  const id = conn.tkPlayerId;
+  if (!id) return;
+  const p = tkPlayers.get(id);
+  if (p && p.id === tkMatch.hostId) {
+    const next = [...tkPlayers.values()].find(pp => !pp.isBot && pp.id !== id && !pp.spectator);
+    tkMatch.hostId = next ? next.id : null;
+  }
+  tkPlayers.delete(id);
+  conn.tkPlayerId = null;
+  if (tkMatch.phase === 'lobby') tkEnsureBots();
+  tkBroadcastLobby();
+}
+
+function tkHandleTeam(conn, msg) {
+  if (tkMatch.phase !== 'lobby') return;
+  const p = tkPlayers.get(conn.tkPlayerId);
+  if (!p || p.isBot || p.spectator) return;
+  const team = msg.team === 'blue' ? 'blue' : 'red';
+  p.team = team;
+  p.color = team === 'red' ? '#ef4444' : '#3b82f6';
+  tkBalanceTeams();
+  tkBroadcastLobby();
+}
+
+function tkHandleReady(conn, msg) {
+  if (tkMatch.phase !== 'lobby') return;
+  if (conn.tkPlayerId !== tkMatch.hostId) return;
+  if (msg.ready) tkStartCountdown();
+}
+
+function tkHandleInput(conn, msg) {
+  const p = tkPlayers.get(conn.tkPlayerId);
+  if (!p || p.isBot || p.spectator) return;
+  const inp = msg.input;
+  if (!inp || typeof inp !== 'object') return;
+  p.input = { up: !!inp.up, down: !!inp.down, left: !!inp.left, right: !!inp.right, fire: !!inp.fire };
+  p.lastSeq = msg.seq || 0;
+  p.lastPing = Date.now();
+}
+
+// -- Broadcast --
+function tkBroadcastAll(raw) {
+  for (const [, p] of tkPlayers) {
+    if (p.ws && p.ws.readyState === 1) safeSend(p.ws, raw);
+  }
+}
+
+function tkBroadcastLobby() {
+  const players = [...tkPlayers.values()].filter(p => !p.spectator).map(p => ({
+    id: p.id, name: p.name, team: p.team, isBot: p.isBot, ready: false,
+  }));
+  const spectators = [...tkPlayers.values()].filter(p => p.spectator).map(p => ({
+    id: p.id, name: p.name,
+  }));
+  const msg = JSON.stringify({
+    v: 1, t: 'lobby-state', phase: tkMatch.phase, hostId: tkMatch.hostId,
+    countdownAt: tkMatch.countdownAt, players, spectators,
+  });
+  tkBroadcastAll(msg);
+}
+
+function tkBuildSnapshot() {
+  const now = Date.now();
+  const tanks = [];
+  for (const [, p] of tkPlayers) {
+    if (p.spectator) continue;
+    tanks.push([
+      p.id, p.name, p.team,
+      Math.round(p.x * 100) / 100, Math.round(p.y * 100) / 100,
+      Math.round(p.dir * 1000) / 1000,
+      p.hp, p.lives, Math.round(p.score * 10) / 10,
+      p.isBot ? 1 : 0, now < p.spawnProt ? 1 : 0, p.alive ? 1 : 0,
+      p.color,
+    ]);
+  }
+  const bullets = tkBullets.filter(b => b.life > 0).map(b => [
+    b.id, b.ownerId,
+    Math.round(b.x * 100) / 100, Math.round(b.y * 100) / 100,
+    Math.round(b.dx * 1000) / 1000, Math.round(b.dy * 1000) / 1000,
+  ]);
+  const eagles = tkEagles.map(e => [e.id, e.team, e.x, e.y, e.hp, e.maxHp, e.alive ? 1 : 0]);
+  return { tick: tkTickN, elapsed: Math.round(tkMatch.elapsed * 10) / 10,
+    tanks, bullets, eagles, bricks: tkCountBricks(), phase: tkMatch.phase,
+    winnerId: tkMatch.winnerId, winnerTeam: tkMatch.winnerTeam };
+}
+
+function tkBroadcastState() {
+  if (tkMatch.phase !== 'running') return;
+  const snap = tkBuildSnapshot();
+  const tc = tkTileChanges.length > 0 ? tkTileChanges : undefined;
+  const ev = tkPendingEvents.length > 0 ? tkPendingEvents : undefined;
+
+  for (const [, p] of tkPlayers) {
+    if (!p.ws || p.ws.readyState !== 1) continue;
+    const msg = { v: 1, t: 'snapshot', ackSeq: p.lastSeq, snapshot: snap };
+    if (tc) msg.tc = tc;
+    if (ev) msg.ev = ev;
+    safeSend(p.ws, JSON.stringify(msg));
+  }
+  tkTileChanges = [];
+  tkPendingEvents = [];
+}
+
+// -- Tick --
+function tkTick() {
+  const now = Date.now();
+  let dms = now - tkLastTick;
+  if (dms < 15) return;
+  if (dms > 500) dms = 500;
+  tkLastTick = now;
+  const dt = Math.min(dms / 1000, TK_MAX_DT);
+
+  // Cleanup disconnected
+  for (const [id, p] of tkPlayers) {
+    if (p.isBot) continue;
+    if (!p.ws || p.ws.readyState !== 1) {
+      if (p.id === tkMatch.hostId) {
+        const next = [...tkPlayers.values()].find(pp => !pp.isBot && pp.id !== id && !pp.spectator && pp.ws && pp.ws.readyState === 1);
+        tkMatch.hostId = next ? next.id : null;
+      }
+      tkPlayers.delete(id);
+      if (tkMatch.phase === 'lobby') tkEnsureBots();
+      tkBroadcastLobby();
+    }
+  }
+
+  if (tkMatch.phase === 'lobby') return;
+  if (tkMatch.phase === 'countdown') {
+    if (now >= tkMatch.countdownAt) tkStartMatch();
+    return;
+  }
+  if (tkMatch.phase === 'ended') {
+    if (now - tkMatch.endedAt >= TK_AUTO_RESET_MS) tkResetLobby();
+    return;
+  }
+
+  // Running
+  tkMatch.elapsed += dt;
+  tkTickN++;
+  tkBotAI(now);
+  for (const [, p] of tkPlayers) {
+    if (p.spectator) continue;
+    if (!p.alive) { tkRespawn(p, now); continue; }
+    tkStepTank(p, now, dt);
+    if (p.input.fire) tkTryFire(p, now);
+  }
+  tkStepBullets(now, dt);
+  tkResolveBvB();
+  tkCleanBullets();
+  tkCheckWin(now);
 }
 
 // ============================================================================
