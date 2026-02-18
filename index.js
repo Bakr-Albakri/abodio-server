@@ -3994,10 +3994,27 @@ function tkRespawn(tank, now) {
     tank.team === 'red' ? s.x <= tkMapSrc.width / 2 : s.x >= tkMapSrc.width / 2
   );
   const pool = spawns.length > 0 ? spawns : tkMapSrc.spawns;
+  const start = Math.floor(Math.random() * pool.length);
   for (let i = 0; i < pool.length; i++) {
-    const s = pool[(Math.floor(Math.random() * pool.length) + i) % pool.length];
+    const s = pool[(start + i) % pool.length];
     if (!tkBlocked(tank, s.x, s.y)) {
       tank.x = s.x; tank.y = s.y;
+      tank.dir = ((s.headingDeg || 0) * Math.PI) / 180;
+      tank.hp = TK_TANK_HP; tank.alive = true;
+      tank.spawnProt = now + TK_SPAWN_PROT_SEC * 1000;
+      tank.vx = 0; tank.vy = 0; tank.fireCD = 0;
+      return;
+    }
+  }
+  // Fallback: scatter around a random spawn if all exact points are occupied
+  const s = pool[start];
+  for (let a = 0; a < 20; a++) {
+    const angle = Math.random() * Math.PI * 2;
+    const dist = TK_TANK_RADIUS * 2.5 + Math.random() * 2.5;
+    const fx = s.x + Math.cos(angle) * dist;
+    const fy = s.y + Math.sin(angle) * dist;
+    if (!tkBlocked(tank, fx, fy)) {
+      tank.x = fx; tank.y = fy;
       tank.dir = ((s.headingDeg || 0) * Math.PI) / 180;
       tank.hp = TK_TANK_HP; tank.alive = true;
       tank.spawnProt = now + TK_SPAWN_PROT_SEC * 1000;
@@ -4139,9 +4156,41 @@ function tkSpawnPlayer(p) {
     p.team === 'red' ? s.x <= tkMapSrc.width / 2 : s.x >= tkMapSrc.width / 2
   );
   const pool = spawns.length > 0 ? spawns : tkMapSrc.spawns;
-  const s = pool[Math.floor(Math.random() * pool.length)];
-  p.x = s.x; p.y = s.y;
-  p.dir = ((s.headingDeg || 0) * Math.PI) / 180;
+  const start = Math.floor(Math.random() * pool.length);
+  let placed = false;
+  for (let i = 0; i < pool.length; i++) {
+    const s = pool[(start + i) % pool.length];
+    if (!tkBlocked(p, s.x, s.y)) {
+      p.x = s.x; p.y = s.y;
+      p.dir = ((s.headingDeg || 0) * Math.PI) / 180;
+      placed = true;
+      break;
+    }
+  }
+  if (!placed) {
+    // Fallback: scatter outward from each spawn until a clear spot is found
+    const attempts = 30;
+    outer: for (const s of pool) {
+      for (let a = 0; a < attempts; a++) {
+        const angle = Math.random() * Math.PI * 2;
+        const dist = TK_TANK_RADIUS * 2.5 + Math.random() * 2.5;
+        const fx = s.x + Math.cos(angle) * dist;
+        const fy = s.y + Math.sin(angle) * dist;
+        if (!tkBlocked(p, fx, fy)) {
+          p.x = fx; p.y = fy;
+          p.dir = ((s.headingDeg || 0) * Math.PI) / 180;
+          placed = true;
+          break outer;
+        }
+      }
+    }
+    if (!placed) {
+      // Last resort: use first spawn position regardless
+      const s = pool[start];
+      p.x = s.x; p.y = s.y;
+      p.dir = ((s.headingDeg || 0) * Math.PI) / 180;
+    }
+  }
   p.hp = TK_TANK_HP; p.lives = TK_DEFAULT_LIVES; p.score = 0;
   p.alive = true; p.spawnProt = Date.now() + TK_SPAWN_PROT_SEC * 1000;
   p.vx = 0; p.vy = 0; p.fireCD = 0; p.respawnAt = 0;
