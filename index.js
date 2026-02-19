@@ -2579,6 +2579,16 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({ s: 'ok', h, b, paused: serverPaused, sgTotal, sgAlive, sgPhase: sgMatch.phase }));
     return;
   }
+
+  if (req.url === '/counts') {
+    const agar = [...players.values()].filter(p => !p.isBot).length;
+    const sg = [...sgPlayers.values()].filter(p => !p.spectator).length;
+    const tk = [...tkPlayers.values()].filter(p => !p.spectator).length;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ agar, 'survival-games': sg, tank1990: tk }));
+    return;
+  }
+
   res.writeHead(404); res.end('Not Found');
 });
 
